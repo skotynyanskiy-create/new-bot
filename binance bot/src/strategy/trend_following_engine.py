@@ -87,7 +87,7 @@ class TrendFollowingEngine:
             adx_strong
             and di_plus > di_minus
             and self._indicators.ribbon_aligned_bullish()
-            and e13 <= candle.close <= e8    # pullback: tra EMA13 e EMA8
+            and e21 <= candle.close <= e13   # pullback: prezzo ritraccia tra EMA21 e EMA13
             and rsi_val > Decimal('45')
         ):
             entry = candle.close
@@ -117,7 +117,7 @@ class TrendFollowingEngine:
             adx_strong
             and di_minus > di_plus
             and self._indicators.ribbon_aligned_bearish()
-            and e8 <= candle.close <= e13   # pullback: tra EMA8 e EMA13
+            and e13 <= candle.close <= e21  # pullback: prezzo ritraccia tra EMA13 e EMA21
             and rsi_val < Decimal('55')
         ):
             entry = candle.close

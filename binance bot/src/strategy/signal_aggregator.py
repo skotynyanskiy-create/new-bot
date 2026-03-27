@@ -90,29 +90,68 @@ class SignalAggregator:
         """
         Calcola score 0-100 per il segnale dato.
         Il segnale ha già uno score base impostato dall'engine.
-        Qui applichiamo bonus/penalità contestuali.
+        Qui applichiamo bonus/penalità contestuali:
+          - ADX strength:    0-10 punti
+          - Volume confirm:  0-8  punti
+          - RSI distance:    0-7  punti
+          - BB position:     0-5  punti
+          - HTF alignment:   +8 o -5 punti
         """
         if signal.signal_type == SignalType.NONE:
             return _ZERO
 
         base = signal.score  # score impostato dall'engine (es. 65, 72, 80)
 
-        # Bonus ADX strength
+        # Bonus ADX strength (0-10)
         try:
             adx_val = self._ind.adx()
             adx_normalized = min(adx_val / Decimal('50'), _ONE) * Decimal('10')
         except ValueError:
             adx_normalized = _ZERO
 
-        # Bonus volume
+        # Bonus volume confirmation (0-8)
+        vol_bonus = _ZERO
         try:
             vol_ma = self._ind.volume_ma()
-            # Sintetizziamo dal candle nel signal (approssimazione)
-            vol_bonus = _ZERO
-        except ValueError:
-            vol_bonus = _ZERO
+            if vol_ma > _ZERO:
+                # Recupera ultimo volume dal buffer indicatori
+                candles = self._ind._candles
+                if candles:
+                    vol_ratio = candles[-1].volume / vol_ma
+                    # vol_ratio >= 2.0 → 8 punti, 1.5 → 6, 1.0 → 4, <1.0 → 0
+                    vol_bonus = min(max(vol_ratio - _ONE, _ZERO) * Decimal('8'), Decimal('8'))
+        except (ValueError, ZeroDivisionError):
+            pass
 
-        # HTF alignment bonus
+        # Bonus RSI distance from neutral (0-7)
+        rsi_bonus = _ZERO
+        try:
+            rsi_val = self._ind.rsi()
+            rsi_distance = abs(rsi_val - Decimal('50'))
+            # RSI a 30 o 70 → distance=20 → 5.6 punti; RSI a 20 o 80 → 8.4 capped a 7
+            rsi_bonus = min(rsi_distance / Decimal('25') * Decimal('7'), Decimal('7'))
+        except ValueError:
+            pass
+
+        # Bonus BB position (0-5): premia segnali vicino alle bande
+        bb_bonus = _ZERO
+        try:
+            bb_upper = self._ind.bb_upper()
+            bb_lower = self._ind.bb_lower()
+            bb_width = bb_upper - bb_lower
+            if bb_width > _ZERO and self._ind._candles:
+                price = self._ind._candles[-1].close
+                if signal.signal_type == SignalType.LONG:
+                    # Più vicino a BB lower → più punti
+                    dist_from_lower = (price - bb_lower) / bb_width
+                    bb_bonus = max(_ZERO, (_ONE - dist_from_lower) * Decimal('5'))
+                elif signal.signal_type == SignalType.SHORT:
+                    dist_from_upper = (bb_upper - price) / bb_width
+                    bb_bonus = max(_ZERO, (_ONE - dist_from_upper) * Decimal('5'))
+        except ValueError:
+            pass
+
+        # HTF alignment bonus (+8 / -5)
         htf_bonus = _ZERO
         if self._htf_ind is not None:
             try:
@@ -127,8 +166,11 @@ class SignalAggregator:
             except ValueError:
                 pass
 
-        final_score = min(base + adx_normalized + htf_bonus, _HUNDRED)
-        return final_score.quantize(Decimal('0.1'))
+        final_score = min(
+            base + adx_normalized + vol_bonus + rsi_bonus + bb_bonus + htf_bonus,
+            _HUNDRED,
+        )
+        return max(final_score, _ZERO).quantize(Decimal('0.1'))
 
     # ------------------------------------------------------------------
     # Selezione migliore

@@ -29,11 +29,15 @@ except ImportError:
 
 from src.config import BotSettings
 from src.core.account_risk import AccountRiskManager
+from src.core.kelly_sizing import KellySizer
 from src.models import Candle, Order, OrderStatus, Side, Signal, SignalType, Trade
 from src.notifications.telegram import TelegramNotifier
 from src.state.persistency import StateManager
 from src.strategy.breakout_engine import BreakoutEngine
 from src.strategy.indicator_engine import IndicatorEngine
+from src.strategy.mean_reversion_engine import MeanReversionEngine
+from src.strategy.trend_following_engine import TrendFollowingEngine
+from src.strategy.signal_aggregator import SignalAggregator
 
 logger = logging.getLogger(__name__)
 
@@ -108,8 +112,26 @@ class DirectionalBot:
             vol_period = s.vol_period,
         )
 
-        self._breakout = BreakoutEngine(config, self._indicators, capital)
+        # Strategy engines
+        self._breakout       = BreakoutEngine(config, self._indicators, capital)
+        self._mean_reversion = MeanReversionEngine(config, self._indicators, capital)
+        self._trend_following = TrendFollowingEngine(config, self._indicators, capital)
+
+        # Signal aggregator con regime detection
+        self._aggregator = SignalAggregator(
+            indicators=self._indicators,
+            htf_indicators=self._htf_indicators,
+        )
+
         self._candles: deque[Candle] = deque(maxlen=200)        # candele 15m
+
+        # Kelly Criterion sizing (attivo dopo kelly_min_trades trade)
+        self._kelly = KellySizer(
+            history_trades=config.kelly_min_trades,
+            half_kelly=True,
+            min_fraction=Decimal('0.005'),
+            max_fraction=Decimal('0.03'),
+        ) if config.kelly_sizing_enabled else None
 
         # Macchina a stati
         self._state: BotState               = BotState.FLAT
@@ -127,6 +149,14 @@ class DirectionalBot:
         self._cooldown_remaining: int          = 0
         # Segnale in attesa di entry alla prossima candela (next_candle_entry)
         self._pending_signal: Optional[Signal] = None
+
+        # Partial TP tracking
+        self._partial_tp1_hit: bool = False  # 50% chiuso a TP1
+        self._partial_tp2_hit: bool = False  # 25% chiuso a TP2
+        self._original_size: Decimal = _ZERO  # size iniziale prima dei partial close
+
+        # Loss streak recovery
+        self._consecutive_losses: int = 0
 
         # PnL tracking
         self.realized_pnl: Decimal = _ZERO
@@ -185,8 +215,21 @@ class DirectionalBot:
         if self._is_daily_stop_active():
             return
 
-        signal = self._breakout.detect(self._candles)
-        if signal.signal_type == SignalType.NONE:
+        # Rileva regime e filtra engine per regime
+        preferred = self._aggregator.preferred_strategies()
+
+        # Raccogli segnali da tutti gli engine adatti al regime
+        signals: list[Signal] = []
+        if "breakout" in preferred:
+            signals.append(self._breakout.detect(self._candles))
+        if "mean_reversion" in preferred:
+            signals.append(self._mean_reversion.detect(self._candles))
+        if "trend_following" in preferred:
+            signals.append(self._trend_following.detect(self._candles))
+
+        # Seleziona il migliore tramite aggregator (scoring + soglia minima)
+        signal = self._aggregator.select_best(signals)
+        if signal is None:
             return
 
         # Filtro multi-timeframe: il trend 1h deve essere allineato
@@ -199,6 +242,28 @@ class DirectionalBot:
 
         if _prom:
             _signals_total.labels(symbol=self.symbol, direction=signal.signal_type.name).inc()
+
+        # Applica Kelly sizing se disponibile
+        if self._kelly and self._kelly.is_ready and signal.atr > _ZERO:
+            sl_distance = self._cfg.strategy.sl_atr_mult * signal.atr
+            kelly_size = self._kelly.position_size(
+                self._capital, sl_distance, fallback_fraction=self._cfg.risk_per_trade_pct
+            )
+            if kelly_size > _ZERO:
+                kelly_size = kelly_size.quantize(Decimal('0.001'))
+                logger.info(
+                    "%s Kelly sizing: %.3f → %.3f",
+                    self.symbol, signal.size, kelly_size,
+                )
+                signal.size = kelly_size
+
+        # Loss streak recovery: riduce size del 50% dopo 3+ loss consecutive
+        if self._consecutive_losses >= 3:
+            signal.size = (signal.size * Decimal('0.5')).quantize(Decimal('0.001'))
+            logger.info(
+                "%s Loss streak recovery (%d consecutive): size dimezzata a %.3f",
+                self.symbol, self._consecutive_losses, signal.size,
+            )
 
         if self._cfg.next_candle_entry:
             # Salva il segnale e aspetta la candela successiva
@@ -215,7 +280,11 @@ class DirectionalBot:
         Se gli indicatori 1h non sono ancora pronti, lascia passare il segnale.
         """
         if not self._htf_indicators.ready():
-            return True  # warmup: non bloccare segnali, dati storici arriveranno presto
+            logger.debug(
+                "%s HTF indicators non pronti — segnale bloccato fino a warmup completato.",
+                self.symbol,
+            )
+            return False  # blocca segnali finché HTF non è pronto
         try:
             ema_fast_htf = self._htf_indicators.ema_fast()
             ema_slow_htf = self._htf_indicators.ema_slow()
@@ -273,24 +342,119 @@ class DirectionalBot:
 
     async def _check_paper_tp_sl(self, candle: Candle) -> None:
         """
-        Simula hit di TP/SL in paper trading controllando high/low della candela.
-        Priorità: SL (protezione capitale) poi TP.
+        Simula hit di TP/SL in paper trading con partial take-profit (50/25/25).
+        Priorità: SL (protezione capitale) poi partial TP1 → TP2 → TP3 (full close).
         """
-        tp = getattr(self, '_tp_price', _ZERO)
         sl = getattr(self, '_sl_price', _ZERO)
-        if tp == _ZERO or sl == _ZERO:
+        if sl == _ZERO or self._position_size == _ZERO:
             return
 
+        s = self._cfg.strategy
+        atr = getattr(self, '_signal_atr', _ZERO)
+
+        # Calcola livelli partial TP
         if self._position_side == Side.BUY:
+            tp1 = self._entry_price + s.partial_tp1_atr * atr if atr > _ZERO else self._tp_price
+            tp2 = self._entry_price + s.partial_tp2_atr * atr if atr > _ZERO else self._tp_price
+            tp3 = self._entry_price + s.partial_tp3_atr * atr if atr > _ZERO else self._tp_price
+
+            # SL check first
             if candle.low <= sl:
                 await self._close_position(sl, "SL hit (paper)")
-            elif candle.high >= tp:
-                await self._close_position(tp, "TP hit (paper)")
+                return
+
+            # Partial TP1: chiudi 50%
+            if not self._partial_tp1_hit and candle.high >= tp1:
+                close_size = (self._original_size * s.partial_tp1_pct).quantize(Decimal('0.001'))
+                if close_size > _ZERO and close_size < self._position_size:
+                    await self._partial_close(tp1, close_size, "TP1 (50%)")
+                    self._partial_tp1_hit = True
+                    # Sposta SL a breakeven dopo TP1
+                    self._sl_price = self._entry_price
+                    logger.info("%s SL spostato a breakeven dopo TP1", self.symbol)
+                    return
+
+            # Partial TP2: chiudi 25%
+            if self._partial_tp1_hit and not self._partial_tp2_hit and candle.high >= tp2:
+                close_size = (self._original_size * s.partial_tp2_pct).quantize(Decimal('0.001'))
+                if close_size > _ZERO and close_size < self._position_size:
+                    await self._partial_close(tp2, close_size, "TP2 (25%)")
+                    self._partial_tp2_hit = True
+                    return
+
+            # TP3 / full TP: chiudi il restante con trailing
+            if self._partial_tp2_hit and candle.high >= tp3:
+                await self._close_position(tp3, "TP3 trail (paper)")
+                return
+
+            # Fallback: TP classico se partial TP non attivo (atr=0)
+            if atr == _ZERO and candle.high >= self._tp_price:
+                await self._close_position(self._tp_price, "TP hit (paper)")
+
         elif self._position_side == Side.SELL:
+            tp1 = self._entry_price - s.partial_tp1_atr * atr if atr > _ZERO else self._tp_price
+            tp2 = self._entry_price - s.partial_tp2_atr * atr if atr > _ZERO else self._tp_price
+            tp3 = self._entry_price - s.partial_tp3_atr * atr if atr > _ZERO else self._tp_price
+
             if candle.high >= sl:
                 await self._close_position(sl, "SL hit (paper)")
-            elif candle.low <= tp:
-                await self._close_position(tp, "TP hit (paper)")
+                return
+
+            if not self._partial_tp1_hit and candle.low <= tp1:
+                close_size = (self._original_size * s.partial_tp1_pct).quantize(Decimal('0.001'))
+                if close_size > _ZERO and close_size < self._position_size:
+                    await self._partial_close(tp1, close_size, "TP1 (50%)")
+                    self._partial_tp1_hit = True
+                    self._sl_price = self._entry_price
+                    logger.info("%s SL spostato a breakeven dopo TP1", self.symbol)
+                    return
+
+            if self._partial_tp1_hit and not self._partial_tp2_hit and candle.low <= tp2:
+                close_size = (self._original_size * s.partial_tp2_pct).quantize(Decimal('0.001'))
+                if close_size > _ZERO and close_size < self._position_size:
+                    await self._partial_close(tp2, close_size, "TP2 (25%)")
+                    self._partial_tp2_hit = True
+                    return
+
+            if self._partial_tp2_hit and candle.low <= tp3:
+                await self._close_position(tp3, "TP3 trail (paper)")
+                return
+
+            if atr == _ZERO and candle.low <= self._tp_price:
+                await self._close_position(self._tp_price, "TP hit (paper)")
+
+    async def _partial_close(self, exit_price: Decimal, close_size: Decimal, reason: str) -> None:
+        """Chiude parzialmente la posizione (partial TP)."""
+        pnl = self._calc_partial_pnl(exit_price, close_size)
+        self.realized_pnl += pnl
+        self._position_size -= close_size
+
+        logger.info(
+            "%s PARTIAL CLOSE (%s) | exit=%.4f size=%.3f pnl=%.4f | remaining=%.3f",
+            self.symbol, reason, exit_price, close_size, pnl, self._position_size,
+        )
+
+        if self._notifier:
+            asyncio.create_task(self._notifier.trade_closed(
+                symbol=self.symbol,
+                side="LONG" if self._position_side == Side.BUY else "SHORT",
+                entry=self._entry_price,
+                exit_price=exit_price,
+                pnl=pnl,
+                reason=reason,
+            ))
+
+        self._save_state()
+
+    def _calc_partial_pnl(self, exit_price: Decimal, size: Decimal) -> Decimal:
+        """PnL netto per chiusura parziale."""
+        if size == _ZERO or self._position_side is None:
+            return _ZERO
+        gross = (exit_price - self._entry_price) * size
+        if self._position_side == Side.SELL:
+            gross = -gross
+        fee = (self._entry_price + exit_price) * size * self._cfg.fee_taker
+        return gross - fee
 
     def _is_daily_stop_active(self) -> bool:
         """Ritorna True se il daily loss limit è stato raggiunto."""
@@ -373,16 +537,23 @@ class DirectionalBot:
         """Apre la posizione e ricalcola TP/SL sul prezzo di fill reale."""
         self._position_side = side
         self._position_size = size
+        self._original_size = size  # per calcoli partial TP
         self._entry_price   = fill_price
         self._entry_time    = time.time()
         self._state         = BotState.POSITION_OPEN
+        self._partial_tp1_hit = False
+        self._partial_tp2_hit = False
 
         # Notifica account risk manager
         if self._account_risk:
             self._account_risk.register_open(self.symbol)
 
-        # Ricalcola TP/SL dal fill reale usando lo stesso ATR del segnale
-        atr = signal.atr
+        # Ricalcola TP/SL dal fill reale; usa ATR corrente se disponibile, altrimenti dal segnale
+        try:
+            atr = self._indicators.atr()
+        except ValueError:
+            atr = signal.atr
+        self._signal_atr = atr  # salva per partial TP
         if side == Side.BUY:
             self._tp_price = fill_price + self._cfg.strategy.tp_atr_mult * atr
             self._sl_price = fill_price - self._cfg.strategy.sl_atr_mult * atr
@@ -420,13 +591,23 @@ class DirectionalBot:
 
             # Piazza TP/SL live con i prezzi ricalcolati sul fill reale
             if self._cfg.live_trading_enabled:
-                await self._gw.submit_tp_sl(
+                tp_sl_ok = await self._gw.submit_tp_sl(
                     self.symbol,
                     order.side,
                     self._position_size,
                     self._tp_price,
                     self._sl_price,
                 )
+                if not tp_sl_ok:
+                    logger.critical(
+                        "%s TP/SL FALLITO — chiusura di emergenza della posizione!",
+                        self.symbol,
+                    )
+                    await self._exit_position_market("tp_sl_placement_failed")
+                    if self._notifier:
+                        asyncio.create_task(self._notifier.info(
+                            f"⚠️ {self.symbol}: TP/SL falliti, posizione chiusa di emergenza"
+                        ))
             return
 
         # Fill di uscita (TP o SL ha fillato)
@@ -483,6 +664,21 @@ class DirectionalBot:
                 pnl=pnl,
                 reason=reason,
             ))
+
+        # Aggiorna Kelly sizer con il risultato del trade
+        if self._kelly and self._position_side is not None:
+            risk_amount = abs(self._entry_price - self._sl_price) * self._original_size
+            self._kelly.update(pnl, risk_amount)
+            if self._kelly.is_ready:
+                logger.info(
+                    "%s Kelly stats: %s", self.symbol, self._kelly.stats()
+                )
+
+        # Aggiorna loss streak
+        if pnl < _ZERO:
+            self._consecutive_losses += 1
+        else:
+            self._consecutive_losses = 0
 
         # Cooldown post-loss: blocca re-entry per N candele dopo SL hit
         if "SL" in reason or "sl" in reason.lower():
@@ -597,10 +793,14 @@ class DirectionalBot:
         self._entry_order    = None
         self._position_side  = None
         self._position_size  = _ZERO
+        self._original_size  = _ZERO
         self._entry_price    = _ZERO
         self._entry_time     = 0.0
         self._tp_price       = _ZERO
         self._sl_price       = _ZERO
+        self._signal_atr     = _ZERO
+        self._partial_tp1_hit = False
+        self._partial_tp2_hit = False
         self._pending_signal = None
         if self._hold_time_task and not self._hold_time_task.done():
             self._hold_time_task.cancel()

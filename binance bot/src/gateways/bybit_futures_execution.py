@@ -138,10 +138,13 @@ class BybitFuturesExecutionGateway(ExecutionGateway):
         size: Decimal,
         tp_price: Decimal,
         sl_price: Decimal,
-    ) -> None:
+        max_retries: int = 3,
+    ) -> bool:
         """
         Imposta TP e SL sulla posizione aperta tramite /v5/position/trading-stop.
         Bybit gestisce TP/SL a livello di posizione, non come ordini separati.
+        Ritenta fino a max_retries volte con backoff esponenziale.
+        Returns True se TP/SL piazzati con successo.
         """
         body = {
             "category":    "linear",
@@ -153,16 +156,32 @@ class BybitFuturesExecutionGateway(ExecutionGateway):
             "tpslMode":    "Full",
             "positionIdx": 0,  # 0 = one-way mode
         }
-        try:
-            resp = await self._signed_post("/v5/position/trading-stop", body)
-            if resp.get("retCode") == 0:
-                logger.info(
-                    "TP/SL impostati: %s | TP=%.4f SL=%.4f", symbol, tp_price, sl_price
+        for attempt in range(max_retries):
+            try:
+                resp = await self._signed_post("/v5/position/trading-stop", body)
+                if resp.get("retCode") == 0:
+                    logger.info(
+                        "TP/SL impostati: %s | TP=%.4f SL=%.4f", symbol, tp_price, sl_price
+                    )
+                    return True
+                else:
+                    logger.error(
+                        "Errore submit_tp_sl %s (tentativo %d/%d): %s",
+                        symbol, attempt + 1, max_retries, resp,
+                    )
+            except Exception as e:
+                logger.error(
+                    "Errore submit_tp_sl %s (tentativo %d/%d): %s",
+                    symbol, attempt + 1, max_retries, e,
                 )
-            else:
-                logger.error("Errore submit_tp_sl %s: %s", symbol, resp)
-        except Exception as e:
-            logger.error("Errore submit_tp_sl %s: %s", symbol, e)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)
+
+        logger.critical(
+            "ATTENZIONE: TP/SL NON piazzati per %s dopo %d tentativi! "
+            "Posizione SENZA protezione.", symbol, max_retries,
+        )
+        return False
 
     async def submit_order(self, order: Order) -> None:
         """Invia ordine LIMIT."""
@@ -300,6 +319,9 @@ class BybitFuturesExecutionGateway(ExecutionGateway):
                     }))
 
                     logger.info("Bybit Private WS connesso.")
+                    # Sync pending orders dopo riconnessione per recuperare fill persi
+                    if attempt > 0:
+                        await self._sync_pending_orders()
                     attempt = 0
 
                     async for message in ws:
@@ -383,6 +405,35 @@ class BybitFuturesExecutionGateway(ExecutionGateway):
 
         if self.on_order_update:
             await self.on_order_update(local_order)
+
+    # ------------------------------------------------------------------
+    # Sync dopo riconnessione WS
+    # ------------------------------------------------------------------
+
+    async def _sync_pending_orders(self) -> None:
+        """Dopo riconnessione WS, controlla ordini pending che potrebbero aver fillato."""
+        if not self._pending_orders:
+            return
+        logger.info("Sync post-reconnect: verifico %d ordini pending...", len(self._pending_orders))
+        try:
+            resp = await self._signed_get(
+                "/v5/order/realtime", {"category": "linear", "limit": "50"}
+            )
+            remote_orders = {
+                o.get("orderId"): o
+                for o in resp.get("result", {}).get("list", [])
+            }
+            for order_id, local_order in list(self._pending_orders.items()):
+                remote = remote_orders.get(order_id)
+                if remote and remote.get("orderStatus") == "Filled":
+                    logger.warning("Ordine %s fillato durante disconnessione — sync!", order_id)
+                    await self._process_order_update(remote)
+                elif not remote:
+                    # Ordine non trovato, potrebbe essere già chiuso
+                    logger.warning("Ordine %s non trovato su exchange — rimosso da pending.", order_id)
+                    self._pending_orders.pop(order_id, None)
+        except Exception as e:
+            logger.error("Errore sync pending orders: %s", e)
 
     # ------------------------------------------------------------------
     # Helper HTTP firmati (Bybit V5 HMAC-SHA256)

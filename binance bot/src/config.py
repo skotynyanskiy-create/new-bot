@@ -1,8 +1,11 @@
+import logging
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, model_validator
 from pydantic_settings import BaseSettings
 from decimal import Decimal
 import os
+
+logger = logging.getLogger(__name__)
 
 
 class StrategySettings(BaseModel):
@@ -57,6 +60,35 @@ class StrategySettings(BaseModel):
     # --- Signal Scoring ---
     min_signal_score: Decimal = Decimal('50')   # score minimo per entrare
 
+    @field_validator('ema_fast')
+    @classmethod
+    def validate_ema_fast(cls, v, info):
+        if v < 2:
+            raise ValueError(f'ema_fast deve essere >= 2, ricevuto {v}')
+        return v
+
+    @model_validator(mode='after')
+    def validate_ema_order(self):
+        if self.ema_fast >= self.ema_slow:
+            raise ValueError(
+                f'ema_fast ({self.ema_fast}) deve essere < ema_slow ({self.ema_slow})'
+            )
+        return self
+
+    @field_validator('rsi_min')
+    @classmethod
+    def validate_rsi_min(cls, v):
+        if not (Decimal('0') < v < Decimal('100')):
+            raise ValueError(f'rsi_min deve essere tra 0 e 100, ricevuto {v}')
+        return v
+
+    @field_validator('rsi_max')
+    @classmethod
+    def validate_rsi_max(cls, v):
+        if not (Decimal('0') < v < Decimal('100')):
+            raise ValueError(f'rsi_max deve essere tra 0 e 100, ricevuto {v}')
+        return v
+
 
 class BotSettings(BaseSettings):
     tokens: list[str] = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "AVAXUSDT"]
@@ -90,6 +122,47 @@ class BotSettings(BaseSettings):
     rate_limit_rps: int = 8
     next_candle_entry: bool = True
     slippage_pct: Decimal = Decimal('0.0005')
+
+    @field_validator('risk_per_trade_pct')
+    @classmethod
+    def validate_risk_pct(cls, v):
+        if not (Decimal('0.001') <= v <= Decimal('0.10')):
+            raise ValueError(
+                f'risk_per_trade_pct deve essere tra 0.1% e 10%, ricevuto {float(v)*100:.1f}%'
+            )
+        return v
+
+    @field_validator('leverage')
+    @classmethod
+    def validate_leverage(cls, v):
+        if not (1 <= v <= 125):
+            raise ValueError(f'leverage deve essere tra 1 e 125, ricevuto {v}')
+        return v
+
+    @field_validator('max_leverage')
+    @classmethod
+    def validate_max_leverage(cls, v):
+        if not (1 <= v <= 125):
+            raise ValueError(f'max_leverage deve essere tra 1 e 125, ricevuto {v}')
+        return v
+
+    @field_validator('max_daily_loss')
+    @classmethod
+    def validate_max_daily_loss(cls, v):
+        if v >= Decimal('0'):
+            raise ValueError(
+                f'max_daily_loss deve essere negativo (es. -30), ricevuto {v}'
+            )
+        return v
+
+    @field_validator('max_position_per_asset')
+    @classmethod
+    def validate_max_position(cls, v):
+        if not (Decimal('0.01') <= v <= Decimal('1.0')):
+            raise ValueError(
+                f'max_position_per_asset deve essere tra 1% e 100%, ricevuto {float(v)*100:.0f}%'
+            )
+        return v
 
     @classmethod
     def load(cls) -> "BotSettings":

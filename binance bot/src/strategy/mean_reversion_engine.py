@@ -96,8 +96,8 @@ class MeanReversionEngine:
             entry = candle.close
             tp    = bb_middle        # obiettivo = ritorno alla media
             sl    = entry - self._cfg.sl_atr_mult * atr_val
-            # Verifica R:R minimo 1:1
-            if (tp - entry) > (entry - sl) * Decimal('0.8'):
+            # Verifica R:R minimo 1:1 (reward >= risk)
+            if (tp - entry) >= (entry - sl):
                 size = self._calc_size(atr_val, entry)
                 if size > _ZERO:
                     logger.info(
@@ -128,7 +128,7 @@ class MeanReversionEngine:
             entry = candle.close
             tp    = bb_middle        # obiettivo = ritorno alla media
             sl    = entry + self._cfg.sl_atr_mult * atr_val
-            if (entry - tp) > (sl - entry) * Decimal('0.8'):
+            if (entry - tp) >= (sl - entry):
                 size = self._calc_size(atr_val, entry)
                 if size > _ZERO:
                     logger.info(

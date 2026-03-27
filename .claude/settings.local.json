@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /c/Users/ccocu/Desktop/\"new bot\"/binance bot/src -name \"*.py\" -type f -exec wc -l {} +)",
+      "Bash(.venv/Scripts/python -c \":*)"
+    ]
+  }
+}

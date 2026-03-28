@@ -16,6 +16,7 @@ Feature:
 """
 
 import asyncio
+import datetime
 import logging
 import time
 from collections import deque
@@ -45,7 +46,7 @@ from src.strategy.mean_reversion_engine import MeanReversionEngine
 from src.gateways.smart_execution import ExecutionAnalytics, SlippageEstimator
 from src.strategy.orderflow_engine import OrderFlowEngine
 from src.strategy.signal_aggregator import SignalAggregator
-from src.strategy.volatility_engine import VolatilityRegimeEngine
+from src.strategy.volatility_engine import VolatilityRegime, VolatilityRegimeEngine
 from src.strategy.trend_following_engine import TrendFollowingEngine
 
 logger = logging.getLogger(__name__)
@@ -336,6 +337,20 @@ class LokyBot:
             if not self._cfg.live_trading_enabled:
                 self._update_trailing_sl(candle)
                 await self._check_paper_tp_sl(candle)
+            # Order Flow divergence exit: se CVD diverge dal prezzo, chiudi anticipatamente
+            # Solo dopo TP1 hit (posizione parziale residua)
+            if self._tp_levels and self._tp_levels[0].hit:
+                price_rising = candle.close > self._entry_price if is_long else candle.close < self._entry_price
+                div = self._orderflow.divergence_signal(price_rising)
+                if div == "bearish_divergence" and is_long:
+                    logger.info("%s Order Flow bearish divergence — exit anticipato", self.symbol)
+                    await self._close_remaining(candle.close, "orderflow_divergence")
+                    return
+                if div == "bullish_divergence" and not is_long:
+                    logger.info("%s Order Flow bullish divergence — exit anticipato", self.symbol)
+                    await self._close_remaining(candle.close, "orderflow_divergence")
+                    return
+
             # Scaling-in: valuta add-on anche in live (solo POSITION_OPEN, non PARTIAL_EXIT)
             if self._state == BotState.POSITION_OPEN:
                 await self._check_scale_in(candle)
@@ -391,7 +406,6 @@ class LokyBot:
             return
 
         # --- Time-of-day filter: evita orari a bassa liquidità ---
-        import datetime
         utc_hour = datetime.datetime.utcnow().hour
         # Evita trading tra 21-23 UTC (bassa liquidità, spread alti)
         # e tra 4-5 UTC (gap di liquidità Asia → Europa)
@@ -400,7 +414,6 @@ class LokyBot:
             return
 
         # --- Volatility regime filter: blocca entry in squeeze/gap ---
-        from src.strategy.volatility_engine import VolatilityRegime
         vol_regime = self._vol_engine.detect()
         if vol_regime == VolatilityRegime.CONTRACTION:
             # Trend esaurito: accetta solo TrendFollowing con score alto
@@ -856,6 +869,13 @@ class LokyBot:
             except ValueError:
                 pass  # ATR non pronto, usa leva statica
 
+        # Portfolio heat: riduce size se portafoglio troppo esposto in una direzione
+        if self._portfolio_risk is not None:
+            heat_mod = self._portfolio_risk.heat_size_modifier()
+            if heat_mod < Decimal('1'):
+                signal.size = (signal.size * heat_mod).quantize(Decimal('0.001'))
+                logger.debug("%s Portfolio heat: size ×%.1f", self.symbol, float(heat_mod))
+
         # Validazione size finale: blocca size invalide prima che arrivino al gateway
         min_notional = Decimal('6')   # Bybit minimum
         max_size     = Decimal('100000')
@@ -902,7 +922,7 @@ class LokyBot:
                 self._candles[-1].close if self._candles else signal.entry_price
             )
             fill_price = self._calc_paper_fill_price(base_price, side, signal.size)
-            self._open_position(side, signal.size, fill_price, signal)
+            await self._open_position(side, signal.size, fill_price, signal)
             return
 
         # Limit entry con market fallback: risparmia ~50% fee (maker vs taker)
@@ -920,7 +940,7 @@ class LokyBot:
             return
         self._entry_order = order
 
-    def _open_position(
+    async def _open_position(
         self,
         side: Side,
         size: Decimal,
@@ -963,13 +983,23 @@ class LokyBot:
                 self._sl_price = atr_sl
         self._sl_price_orig = self._sl_price
 
-        # 3 livelli di Partial TP
-        # TP3 viene affinato usando il livello S/R più vicino nella direzione del trade:
-        # questo posiziona il target finale su struttura reale invece di ATR fisso.
+        # Regime-specific TP multiplier: allarga/stringe i target in base al regime
+        regime = self._aggregator.detect_regime()
+        if regime == "STRONG_TREND":
+            tp_mult = Decimal('1.5')  # trend forte: target più lontani
+        elif regime == "RANGING":
+            tp_mult = Decimal('0.7')  # ranging: target più stretti
+        elif regime == "CHOPPY":
+            tp_mult = Decimal('0.5')  # choppy: exit rapido
+        else:
+            tp_mult = Decimal('1.0')
+
+        # 3 livelli di Partial TP (adattati al regime)
+        # TP3 viene affinato usando il livello S/R più vicino nella direzione del trade.
         if side == Side.BUY:
-            tp1 = fill_price + s.partial_tp1_atr * atr
-            tp2 = fill_price + s.partial_tp2_atr * atr
-            tp3_atr = fill_price + s.partial_tp3_atr * atr
+            tp1 = fill_price + s.partial_tp1_atr * atr * tp_mult
+            tp2 = fill_price + s.partial_tp2_atr * atr * tp_mult
+            tp3_atr = fill_price + s.partial_tp3_atr * atr * tp_mult
             # Usa la resistenza strutturale più vicina sopra fill_price come TP3 se disponibile
             # e se cade tra TP2 e tp3_atr × 1.5 (non troppo vicino né troppo lontano)
             try:
@@ -990,9 +1020,9 @@ class LokyBot:
                 TPLevel(tp3, s.partial_tp3_pct),
             ]
         else:
-            tp1 = fill_price - s.partial_tp1_atr * atr
-            tp2 = fill_price - s.partial_tp2_atr * atr
-            tp3_atr = fill_price - s.partial_tp3_atr * atr
+            tp1 = fill_price - s.partial_tp1_atr * atr * tp_mult
+            tp2 = fill_price - s.partial_tp2_atr * atr * tp_mult
+            tp3_atr = fill_price - s.partial_tp3_atr * atr * tp_mult
             # Usa il supporto strutturale più vicino sotto fill_price come TP3 per SHORT
             try:
                 nearest_s = self._indicators.nearest_support_below(fill_price)
@@ -1053,7 +1083,7 @@ class LokyBot:
             logger.warning("%s Fill ricevuto prima di _entry_order — ignorato.", self.symbol)
             return
         if self._state == BotState.ENTERING and self._entry_order and order.id == self._entry_order.id:
-            self._open_position(order.side, order.filled_size, order.price, self._current_signal)
+            await self._open_position(order.side, order.filled_size, order.price, self._current_signal)
             if self._cfg.live_trading_enabled and self._tp_levels:
                 await self._gw.submit_tp_sl(
                     self.symbol,

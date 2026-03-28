@@ -22,6 +22,7 @@ Soglie:
 """
 
 import logging
+import math
 from decimal import Decimal
 from typing import Optional
 
@@ -129,8 +130,6 @@ class SignalAggregator:
 
         Il base score dell'engine vale come floor (non viene ignorato).
         """
-        import math
-
         if signal.signal_type == SignalType.NONE:
             return _ZERO
 

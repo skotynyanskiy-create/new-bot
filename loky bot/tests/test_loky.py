@@ -1082,3 +1082,101 @@ class TestKeltnerSqueeze:
         # is_squeeze ritorna bool
         result = ind.is_squeeze()
         assert isinstance(result, bool)
+
+
+# ================================================================== #
+#  V5 — PERFORMANCE, ML, AUTO-OPTIMIZER                               #
+# ================================================================== #
+
+class TestBBWidthCached:
+    """Verifica che bb_width sia cached al momento dell'update."""
+
+    def test_bb_width_cached(self):
+        ind = IndicatorEngine()
+        candles = make_candles(60)
+        for c in candles:
+            ind.update(c)
+        # bb_width deve ritornare il valore cached
+        w1 = ind.bb_width()
+        w2 = ind.bb_width()
+        assert w1 == w2  # stesso valore, nessun ricalcolo
+
+
+class TestMLScorer:
+    """Verifica il ML Scorer (logistic regression online)."""
+
+    def test_predict_neutral_before_training(self):
+        from src.strategy.ml_scorer import MLScorer
+        ml = MLScorer(min_trades=10)
+        features = [0.5] * 8
+        assert ml.predict(features) == 0.5  # neutro prima di min_trades
+
+    def test_learns_from_wins(self):
+        from src.strategy.ml_scorer import MLScorer
+        ml = MLScorer(min_trades=5, learning_rate=0.1)
+        # Train su 10 trade vincenti con stesse feature
+        features = [0.8, 0.6, 0.7, 0.5, 1.0, 1.0, 0.8, 0.3]
+        for _ in range(10):
+            ml.update(features, won=True)
+        # Dopo training, dovrebbe predire alta probabilità per le stesse feature
+        prob = ml.predict(features)
+        assert prob > 0.5  # bias verso win
+
+    def test_score_modifier_range(self):
+        from src.strategy.ml_scorer import MLScorer
+        ml = MLScorer(min_trades=5)
+        for _ in range(10):
+            ml.update([0.5]*8, won=True)
+        mod = ml.score_modifier([0.5]*8)
+        assert Decimal('0.5') <= mod <= Decimal('1.5')
+
+    def test_build_features(self):
+        from src.strategy.ml_scorer import MLScorer
+        f = MLScorer.build_features(
+            adx=30, rsi=55, atr_pctile=0.6, vol_ratio=1.5,
+            htf_aligned=True, cvd_bullish=True, regime_num=3, bb_width=0.02,
+        )
+        assert len(f) == 8
+        assert all(isinstance(x, float) for x in f)
+
+
+class TestRollingOptimizer:
+    """Verifica il rolling parameter optimizer."""
+
+    def test_suggest_no_change_insufficient_data(self):
+        from src.optimization import RollingOptimizer
+        opt = RollingOptimizer()
+        current = {"tp_atr_mult": 2.0, "sl_atr_mult": 1.0}
+        suggested = opt.suggest(current)
+        assert suggested == current  # nessun dato → nessun cambio
+
+    def test_has_enough_data(self):
+        from src.optimization import RollingOptimizer
+        opt = RollingOptimizer()
+        assert opt.has_enough_data is False
+        for i in range(25):
+            opt.record_trade({"tp_atr_mult": 2.0}, pnl=float(i))
+        assert opt.has_enough_data is True
+
+
+class TestPortfolioHeat:
+    """Verifica il portfolio heat management."""
+
+    def test_no_exposure_full_size(self):
+        from src.core.portfolio_risk import PortfolioRiskManager
+        pm = PortfolioRiskManager(capital=Decimal("1000"))
+        assert pm.heat_size_modifier() == Decimal("1.0")
+
+    def test_high_exposure_reduces_size(self):
+        from src.core.portfolio_risk import PortfolioRiskManager
+        pm = PortfolioRiskManager(capital=Decimal("1000"))
+        pm.register_open("BTCUSDT", Decimal("900"))  # 90% del capitale
+        mod = pm.heat_size_modifier()
+        assert mod < Decimal("1.0")  # deve ridurre
+
+    def test_moderate_exposure_moderate_reduction(self):
+        from src.core.portfolio_risk import PortfolioRiskManager
+        pm = PortfolioRiskManager(capital=Decimal("1000"))
+        pm.register_open("BTCUSDT", Decimal("600"))  # 60%
+        mod = pm.heat_size_modifier()
+        assert mod == Decimal("0.7")

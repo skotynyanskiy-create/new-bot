@@ -28,6 +28,7 @@ import csv
 import json
 import logging
 import math
+import sqlite3
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -283,11 +284,16 @@ class CandleBacktestEngine:
 
     async def _fetch_candles(self, timeframe: str) -> List[Candle]:
         """
-        Scarica dati storici da Bybit V5 /v5/market/kline.
-
-        Bybit restituisce i dati dal più recente al più vecchio → invertiamo.
-        Limit per request: max 1000.
+        Scarica dati storici da Bybit V5 /v5/market/kline con cache SQLite locale.
+        Prima run: scarica da API e salva in cache.
+        Run successive: carica da cache se dati recenti (< 24h).
         """
+        # Prova cache locale
+        cached = self._load_from_cache(timeframe)
+        if cached:
+            logger.info("Cache hit: %s %s → %d candele da cache locale", self.symbol, timeframe, len(cached))
+            return cached
+
         interval = _TF_MAP.get(timeframe, "15")
         end_ms   = int(time.time() * 1000)
         start_ms = end_ms - self.days * 86_400 * 1000
@@ -367,7 +373,95 @@ class CandleBacktestEngine:
         logger.info(
             "Bybit %s %s: %d candele scaricate.", self.symbol, timeframe, len(result)
         )
+
+        # Salva in cache locale
+        if result:
+            self._save_to_cache(timeframe, result)
+
         return result
+
+    # ------------------------------------------------------------------
+    # Cache SQLite locale per dati storici
+    # ------------------------------------------------------------------
+
+    def _cache_db_path(self) -> str:
+        return f"data/backtest_cache_{self.symbol}.db"
+
+    def _init_cache_db(self) -> sqlite3.Connection:
+        import os
+        os.makedirs("data", exist_ok=True)
+        conn = sqlite3.connect(self._cache_db_path())
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS candle_cache (
+                symbol TEXT, timeframe TEXT, timestamp REAL,
+                open TEXT, high TEXT, low TEXT, close TEXT, volume TEXT,
+                fetched_at REAL,
+                PRIMARY KEY (symbol, timeframe, timestamp)
+            )
+        """)
+        conn.commit()
+        return conn
+
+    def _load_from_cache(self, timeframe: str) -> Optional[List[Candle]]:
+        """Carica candele dalla cache se presenti e recenti (< 24h)."""
+        import os
+        if not os.path.exists(self._cache_db_path()):
+            return None
+        try:
+            conn = self._init_cache_db()
+            end_ts = time.time()
+            start_ts = end_ts - self.days * 86_400
+            # Controlla se la cache è recente
+            row = conn.execute(
+                "SELECT MAX(fetched_at) FROM candle_cache WHERE symbol=? AND timeframe=?",
+                (self.symbol, timeframe),
+            ).fetchone()
+            if not row or row[0] is None or (time.time() - row[0]) > 86_400:
+                conn.close()
+                return None  # cache scaduta o vuota
+            rows = conn.execute(
+                "SELECT timestamp, open, high, low, close, volume FROM candle_cache "
+                "WHERE symbol=? AND timeframe=? AND timestamp>=? AND timestamp<=? "
+                "ORDER BY timestamp",
+                (self.symbol, timeframe, start_ts, end_ts),
+            ).fetchall()
+            conn.close()
+            if len(rows) < 60:
+                return None  # dati insufficienti
+            return [
+                Candle(
+                    symbol=self.symbol, timeframe=timeframe,
+                    open=Decimal(r[1]), high=Decimal(r[2]),
+                    low=Decimal(r[3]), close=Decimal(r[4]),
+                    volume=Decimal(r[5]), timestamp=r[0], is_closed=True,
+                )
+                for r in rows
+            ]
+        except Exception as e:
+            logger.warning("Cache load error: %s", e)
+            return None
+
+    def _save_to_cache(self, timeframe: str, candles: List[Candle]) -> None:
+        """Salva candele nella cache SQLite locale."""
+        try:
+            conn = self._init_cache_db()
+            now = time.time()
+            with conn:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO candle_cache "
+                    "(symbol, timeframe, timestamp, open, high, low, close, volume, fetched_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (c.symbol, timeframe, c.timestamp,
+                         str(c.open), str(c.high), str(c.low), str(c.close), str(c.volume), now)
+                        for c in candles
+                    ],
+                )
+            conn.close()
+            logger.info("Cache saved: %s %s → %d candele", self.symbol, timeframe, len(candles))
+        except Exception as e:
+            logger.warning("Cache save error: %s", e)
 
     # ------------------------------------------------------------------
     # Aggregazione trade da StateManager

@@ -233,6 +233,41 @@ class PortfolioRiskManager:
         self._capital = new_capital
 
     # ------------------------------------------------------------------
+    # Portfolio Heat Management
+    # ------------------------------------------------------------------
+
+    def net_exposure_direction(self) -> tuple[str, Decimal]:
+        """
+        Calcola l'esposizione netta del portafoglio.
+
+        Returns:
+            ("long", pct) o ("short", pct) o ("neutral", 0)
+            dove pct è la % del capitale esposta netta in una direzione.
+        """
+        # Per ora tracciamo solo il notional totale (tutto nella stessa direzione)
+        total = self.total_notional()
+        if total <= _ZERO:
+            return "neutral", _ZERO
+        pct = total / self._capital
+        return "long", pct  # simplified: assume all positions same direction
+
+    def heat_size_modifier(self) -> Decimal:
+        """
+        Riduce la size dei nuovi trade se il portafoglio è troppo esposto
+        in una sola direzione.
+
+        net_exposure > 80% capitale → size ×0.5 (molto esposto)
+        net_exposure > 50% capitale → size ×0.7
+        altrimenti → size ×1.0
+        """
+        _, pct = self.net_exposure_direction()
+        if pct > Decimal('0.80'):
+            return Decimal('0.5')
+        elif pct > Decimal('0.50'):
+            return Decimal('0.7')
+        return Decimal('1.0')
+
+    # ------------------------------------------------------------------
     # Correlazione dinamica rolling
     # ------------------------------------------------------------------
 

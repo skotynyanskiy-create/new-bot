@@ -97,6 +97,7 @@ class IndicatorEngine:
         self._bb_upper_val:  Optional[Decimal] = None
         self._bb_lower_val:  Optional[Decimal] = None
         self._bb_middle_val: Optional[Decimal] = None
+        self._bb_width_val:  Optional[Decimal] = None
 
         # --- EMA Ribbon (8, 13, 21, 34, 55) ---
         self._ribbon_vals:  dict[int, Optional[Decimal]] = {p: None for p in _RIBBON_PERIODS}
@@ -184,7 +185,8 @@ class IndicatorEngine:
         """Media mobile semplice del volume sulle ultime vol_period candele."""
         if len(self._candles) < self._vol_period:
             raise ValueError("Volume MA non ancora disponibile")
-        recent = list(self._candles)[-self._vol_period:]
+        start = max(0, len(self._candles) - self._vol_period)
+        recent = itertools.islice(self._candles, start, len(self._candles))
         return sum(c.volume for c in recent) / Decimal(self._vol_period)
 
     def volume_ratio(self) -> Decimal:
@@ -274,12 +276,10 @@ class IndicatorEngine:
         return self._bb_middle_val
 
     def bb_width(self) -> Decimal:
-        """BB Width = (upper - lower) / middle. Misura di volatilità."""
-        if self._bb_upper_val is None or self._bb_middle_val is None:
+        """BB Width = (upper - lower) / middle. Cached at update time."""
+        if self._bb_width_val is None:
             raise ValueError("Bollinger Bands non ancora disponibili")
-        if self._bb_middle_val == _ZERO:
-            return _ZERO
-        return (self._bb_upper_val - self._bb_lower_val) / self._bb_middle_val
+        return self._bb_width_val
 
     # ------------------------------------------------------------------
     # Keltner Channel & Squeeze
@@ -396,15 +396,19 @@ class IndicatorEngine:
         price = candle.close
         if self._ema_fast_val is None:
             if self._n >= self._ema_fast_period:
-                buf = list(self._candles)[-self._ema_fast_period:]
-                self._ema_fast_val = sum(c.close for c in buf) / Decimal(self._ema_fast_period)
+                start = max(0, len(self._candles) - self._ema_fast_period)
+                self._ema_fast_val = sum(
+                    c.close for c in itertools.islice(self._candles, start, len(self._candles))
+                ) / Decimal(self._ema_fast_period)
         else:
             self._ema_fast_val = (price - self._ema_fast_val) * self._k_fast + self._ema_fast_val
 
         if self._ema_slow_val is None:
             if self._n >= self._ema_slow_period:
-                buf = list(self._candles)[-self._ema_slow_period:]
-                self._ema_slow_val = sum(c.close for c in buf) / Decimal(self._ema_slow_period)
+                start = max(0, len(self._candles) - self._ema_slow_period)
+                self._ema_slow_val = sum(
+                    c.close for c in itertools.islice(self._candles, start, len(self._candles))
+                ) / Decimal(self._ema_slow_period)
         else:
             self._ema_slow_val = (price - self._ema_slow_val) * self._k_slow + self._ema_slow_val
 
@@ -524,7 +528,8 @@ class IndicatorEngine:
         if len(self._candles) < self._bb_period:
             return
 
-        closes = [c.close for c in list(self._candles)[-self._bb_period:]]
+        start = max(0, len(self._candles) - self._bb_period)
+        closes = [c.close for c in itertools.islice(self._candles, start, len(self._candles))]
         n = Decimal(self._bb_period)
         mean = sum(closes) / n
 
@@ -535,6 +540,11 @@ class IndicatorEngine:
         self._bb_middle_val = mean
         self._bb_upper_val  = mean + self._bb_std * std
         self._bb_lower_val  = mean - self._bb_std * std
+        # Cache bb_width per evitare ricalcolo ad ogni query
+        if mean > _ZERO:
+            self._bb_width_val = (self._bb_upper_val - self._bb_lower_val) / mean
+        else:
+            self._bb_width_val = _ZERO
 
     # ------------------------------------------------------------------
     # Metodi privati di calcolo — EMA Ribbon
@@ -545,8 +555,10 @@ class IndicatorEngine:
         for period in _RIBBON_PERIODS:
             if self._ribbon_vals[period] is None:
                 if self._n >= period:
-                    buf = list(self._candles)[-period:]
-                    self._ribbon_vals[period] = sum(c.close for c in buf) / Decimal(period)
+                    start = max(0, len(self._candles) - period)
+                    self._ribbon_vals[period] = sum(
+                        c.close for c in itertools.islice(self._candles, start, len(self._candles))
+                    ) / Decimal(period)
             else:
                 k = self._ribbon_k[period]
                 self._ribbon_vals[period] = (price - self._ribbon_vals[period]) * k + self._ribbon_vals[period]
@@ -564,14 +576,15 @@ class IndicatorEngine:
         if self._n - self._sr_cache_n < self._sr_cache_interval and self._sr_cache_n > 0:
             return
 
-        buf = list(self._candles)
-        if len(buf) < 5:
+        n = len(self._candles)
+        if n < 5:
             self._sr_support_cache = []
             self._sr_resistance_cache = []
             self._sr_cache_n = self._n
             return
 
-        window = buf[-lookback:] if len(buf) >= lookback else buf
+        start = max(0, n - lookback)
+        window = list(itertools.islice(self._candles, start, n))
 
         # Support pivots
         sup_pivots: list[Decimal] = []

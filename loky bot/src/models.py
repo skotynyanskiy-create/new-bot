@@ -42,7 +42,7 @@ class Position:
 
 @dataclass
 class Trade:
-    """Record immutabile di un'esecuzione avvenuta, per audit trail e PnL."""
+    """Record di un'esecuzione avvenuta, per audit trail e PnL."""
     symbol: str
     side: Side
     size: Decimal
@@ -93,7 +93,7 @@ class Signal:
     strategy_name: str = "breakout"         # nome della strategia origine
 
 
-@dataclass
+@dataclass(slots=True)
 class TPLevel:
     """Livello parziale di Take Profit."""
     price: Decimal

@@ -168,7 +168,9 @@ class LokyBot:
         self._mean_rev      = MeanReversionEngine(config, self._indicators, capital)
         self._trend_follow  = TrendFollowingEngine(config, self._indicators, capital)
         self._funding_rate  = FundingRateEngine(config, self._indicators, capital, testnet=config.testnet)
-        self._sentiment     = MarketSentimentEngine(testnet=config.testnet)
+        self._sentiment     = MarketSentimentEngine(
+            testnet=config.testnet, live_trading=config.live_trading_enabled,
+        )
 
         # --- Signal scoring ---
         self._aggregator = SignalAggregator(
@@ -462,15 +464,18 @@ class LokyBot:
         # --- Detect regime e raccoglie segnali ---
         signals = self._collect_signals()
 
-        # Funding rate engine: sondaggio ogni 4 candle
+        # Async engines: parallelizza funding + sentiment (evita serial HTTP)
+        async_tasks = []
         if self._candle_count % 4 == 0:
-            funding_sig = await self._collect_funding_signal()
-            if funding_sig is not None:
-                signals.append(funding_sig)
-
-        # Market sentiment: aggiorna OI + L/S ratio ogni 8 candle
+            async_tasks.append(self._collect_funding_signal())
         if self._candle_count % 8 == 0:
-            await self._update_sentiment(candle)
+            async_tasks.append(self._update_sentiment(candle))
+        if async_tasks:
+            results = await asyncio.gather(*async_tasks, return_exceptions=True)
+            # Il primo risultato potrebbe essere un Signal (funding) o None (sentiment)
+            for r in results:
+                if isinstance(r, Signal) and r.signal_type != SignalType.NONE:
+                    signals.append(r)
 
         if not signals:
             return

@@ -74,8 +74,13 @@ class FundingRateEngine:
     async def detect(self, candles: deque[Candle]) -> Signal:
         """
         Recupera il funding rate corrente e genera segnale se sopra/sotto threshold.
+        In paper/backtest mode, skip HTTP call (no funding rate data disponibile).
         """
         if not self._indicators.ready():
+            return self._no_signal(candles[-1] if candles else None)
+
+        # Skip HTTP in paper/backtest: funding rate non disponibile senza API live
+        if not self._top_cfg.live_trading_enabled:
             return self._no_signal(candles[-1] if candles else None)
 
         candle = candles[-1]

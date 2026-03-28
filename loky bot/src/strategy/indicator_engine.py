@@ -550,22 +550,44 @@ class IndicatorEngine:
     # ------------------------------------------------------------------
 
     def _update_bb(self) -> None:
-        if len(self._candles) < self._bb_period:
+        n_candles = len(self._candles)
+        if n_candles < self._bb_period:
             return
 
-        start = max(0, len(self._candles) - self._bb_period)
-        closes = [c.close for c in itertools.islice(self._candles, start, len(self._candles))]
         n = Decimal(self._bb_period)
-        mean = sum(closes) / n
+        new_close = self._candles[-1].close
 
-        # Deviazione standard (population std)
-        variance = sum((c - mean) ** 2 for c in closes) / n
+        # Incrementale O(1): mantieni running sum e sum-of-squares
+        if not hasattr(self, '_bb_sum') or self._bb_sum is None:
+            # Prima inizializzazione: calcola da zero
+            start = max(0, n_candles - self._bb_period)
+            window = list(itertools.islice(self._candles, start, n_candles))
+            self._bb_sum = sum(c.close for c in window)
+            self._bb_sumsq = sum(c.close ** 2 for c in window)
+        else:
+            # Incrementale: rimuovi il più vecchio, aggiungi il più nuovo
+            if n_candles > self._bb_period:
+                old_idx = n_candles - self._bb_period - 1
+                old_close = list(itertools.islice(self._candles, old_idx, old_idx + 1))[0].close
+                self._bb_sum = self._bb_sum - old_close + new_close
+                self._bb_sumsq = self._bb_sumsq - old_close ** 2 + new_close ** 2
+            else:
+                # Esattamente bb_period candle: ricalcola (raro)
+                start = max(0, n_candles - self._bb_period)
+                window = list(itertools.islice(self._candles, start, n_candles))
+                self._bb_sum = sum(c.close for c in window)
+                self._bb_sumsq = sum(c.close ** 2 for c in window)
+
+        mean = self._bb_sum / n
+        # Varianza = E[X²] - E[X]² (formula computazionale, O(1))
+        variance = (self._bb_sumsq / n) - (mean ** 2)
+        if variance < _ZERO:
+            variance = _ZERO  # floating point guard
         std = variance.sqrt()
 
         self._bb_middle_val = mean
         self._bb_upper_val  = mean + self._bb_std * std
         self._bb_lower_val  = mean - self._bb_std * std
-        # Cache bb_width per evitare ricalcolo ad ogni query
         if mean > _ZERO:
             self._bb_width_val = (self._bb_upper_val - self._bb_lower_val) / mean
         else:

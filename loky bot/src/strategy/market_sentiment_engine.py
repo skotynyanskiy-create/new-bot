@@ -95,12 +95,24 @@ class MarketSentimentEngine:
         ls_period — periodo per il L/S ratio (Bybit: "5min", "15min", "30min", "1h", "4h", "1d")
     """
 
-    def __init__(self, testnet: bool = False, ls_period: str = "5min") -> None:
+    def __init__(self, testnet: bool = False, ls_period: str = "5min", live_trading: bool = False) -> None:
         self._base_url   = _BASE_TESTNET_URL if testnet else _BASE_URL
         self._ls_period  = ls_period
+        self._live_trading = live_trading
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
         self._cache: dict[str, SentimentResult] = {}   # symbol → last result
+
+    @staticmethod
+    def _neutral_result(symbol: str, candle) -> 'SentimentResult':
+        """Risultato neutro per paper/backtest mode (no HTTP calls)."""
+        return SentimentResult(
+            symbol=symbol,
+            oi_current=_ZERO, oi_prev=_ZERO, oi_delta_pct=_ZERO,
+            ls_ratio=Decimal('0.5'),  # 50/50 neutro
+            block_long=False, block_short=False,
+            score_adjustment=0, timestamp=time.time(),
+        )
 
     # ------------------------------------------------------------------
     # API pubblica
@@ -109,11 +121,13 @@ class MarketSentimentEngine:
     async def analyze(self, symbol: str, candle: Candle) -> SentimentResult:
         """
         Analizza OI e L/S ratio per il symbol.
-        Usa la cache se disponibile e non stale.
-
-        Returns:
-            SentimentResult con block flags e score adjustment.
+        In paper/backtest: ritorna neutro (no HTTP calls).
+        In live: usa cache con TTL, fetch da Bybit API.
         """
+        # Paper/backtest mode: skip HTTP, ritorna neutro
+        if not self._live_trading:
+            return self._neutral_result(symbol, candle)
+
         # Cache hit
         if symbol in self._cache and not self._cache[symbol].is_stale:
             return self._cache[symbol]

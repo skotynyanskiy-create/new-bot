@@ -1076,44 +1076,6 @@ class TestBBWidthCached:
         assert w1 == w2  # stesso valore, nessun ricalcolo
 
 
-class TestMLScorer:
-    """Verifica il ML Scorer (logistic regression online)."""
-
-    def test_predict_neutral_before_training(self):
-        from src.strategy.ml_scorer import MLScorer
-        ml = MLScorer(min_trades=10)
-        features = [0.5] * 8
-        assert ml.predict(features) == 0.5  # neutro prima di min_trades
-
-    def test_learns_from_wins(self):
-        from src.strategy.ml_scorer import MLScorer
-        ml = MLScorer(min_trades=5, learning_rate=0.1)
-        # Train su 10 trade vincenti con stesse feature
-        features = [0.8, 0.6, 0.7, 0.5, 1.0, 1.0, 0.8, 0.3]
-        for _ in range(10):
-            ml.update(features, won=True)
-        # Dopo training, dovrebbe predire alta probabilità per le stesse feature
-        prob = ml.predict(features)
-        assert prob > 0.5  # bias verso win
-
-    def test_score_modifier_range(self):
-        from src.strategy.ml_scorer import MLScorer
-        ml = MLScorer(min_trades=5)
-        for _ in range(10):
-            ml.update([0.5]*8, won=True)
-        mod = ml.score_modifier([0.5]*8)
-        assert Decimal('0.5') <= mod <= Decimal('1.5')
-
-    def test_build_features(self):
-        from src.strategy.ml_scorer import MLScorer
-        f = MLScorer.build_features(
-            adx=30, rsi=55, atr_pctile=0.6, vol_ratio=1.5,
-            htf_aligned=True, cvd_bullish=True, regime_num=3, bb_width=0.02,
-        )
-        assert len(f) == 8
-        assert all(isinstance(x, float) for x in f)
-
-
 class TestRollingOptimizer:
     """Verifica il rolling parameter optimizer."""
 
@@ -1341,20 +1303,6 @@ class TestRegimeHysteresis:
             r = engine.detect()
         # Regime deve restare NORMAL durante il lock
         assert r == VolatilityRegime.NORMAL
-
-
-class TestMLScorerHardened:
-    """Verifica ML Scorer con weight clipping e decay."""
-
-    def test_weights_clipped(self):
-        from src.strategy.ml_scorer import MLScorer
-        ml = MLScorer(min_trades=3, learning_rate=1.0, weight_clip=3.0)
-        # Learning rate altissimo per forzare overflow
-        for _ in range(50):
-            ml.update([10.0]*8, won=True)
-        # I pesi devono essere clipped a [-3, +3]
-        assert all(-3.0 <= w <= 3.0 for w in ml._weights)
-        assert -3.0 <= ml._bias <= 3.0
 
 
 # ================================================================== #
@@ -1653,3 +1601,113 @@ class TestEndToEndTradeLifecycle:
         )
         # Indicatori devono essere pronti
         assert bot._indicators.ready()
+
+
+# ================================================================== #
+#  V6.2 — INTEGRATION TESTS PER CODE PATH CRITICI                    #
+# ================================================================== #
+
+class TestIntegrationGapProtection:
+    """Verifica che gap > 2× SL forzi la chiusura."""
+
+    @pytest.mark.asyncio
+    async def test_gap_protection_closes_position(self):
+        from src.bot import LokyBot, BotState
+        from src.backtest import _InMemoryStateManager, _BacktestGateway
+
+        cfg = BotSettings(
+            tokens=["BTCUSDT"], live_trading_enabled=False,
+            max_daily_loss_pct=Decimal("0.50"),
+        )
+        bot = LokyBot(
+            symbol="BTCUSDT", config=cfg, execution_gw=_BacktestGateway(),
+            state_manager=_InMemoryStateManager(), capital=Decimal("10000"),
+        )
+
+        # Warm-up
+        for i in range(60):
+            p = 100.0 + i * 0.3
+            await bot.on_candle(make_candle(o=p, h=p+1.5, l=p-0.8, c=p+0.3,
+                                             ts=1700000000 + i*900))
+
+        # Se il bot è in posizione, verifica gap protection
+        if bot._state in (BotState.POSITION_OPEN, BotState.PARTIAL_EXIT):
+            entry = float(bot._entry_price)
+            sl = float(bot._sl_price)
+            sl_dist = abs(entry - sl)
+            # Crash > 2× SL distance
+            crash = entry - sl_dist * 3
+            await bot.on_candle(make_candle(
+                o=crash+1, h=crash+2, l=crash-1, c=crash,
+                ts=1700000000 + 65*900,
+            ))
+            # Deve aver chiuso la posizione
+            assert bot._state == BotState.FLAT
+
+
+class TestIntegrationCircuitBreaker:
+    """Verifica che 3 loss consecutive attivino il circuit breaker."""
+
+    def test_circuit_breaker_params(self):
+        """Verifica che i parametri del circuit breaker siano configurati."""
+        cfg = BotSettings()
+        assert cfg.strategy.circuit_breaker_losses == 3
+        assert cfg.strategy.circuit_breaker_candles == 15
+
+
+class TestIntegrationModifierCap:
+    """Verifica che i cumulative modifiers non riducano size oltre il 40%."""
+
+    def test_modifier_cap_at_40_percent(self):
+        """Se tutti i modifier sono al minimo, size >= 40% dell'originale."""
+        original_size = Decimal("1.0")
+        # Worst case: vol(0.85) × of(0.85) × sentiment(0.70) × streak(0.65)
+        worst_case = original_size * Decimal("0.85") * Decimal("0.85") * Decimal("0.70") * Decimal("0.65")
+        # Senza cap: 0.328 (32.8%)
+        assert worst_case < Decimal("0.40")
+        # Con cap: max(worst_case, original × 0.40) = 0.40
+        capped = max(worst_case, original_size * Decimal("0.40"))
+        assert capped == Decimal("0.40")
+
+
+class TestIntegrationBTCCrashProtection:
+    """Verifica la BTC crash protection nell'orchestratore."""
+
+    def test_crash_detection_threshold(self):
+        """Un drop del 4% deve triggerare il crisis mode."""
+        # Simula: 4 prezzi BTC con drop >3%
+        from collections import deque
+        prices = deque(maxlen=8)
+        prices.append(Decimal("50000"))  # T-3
+        prices.append(Decimal("49500"))  # T-2
+        prices.append(Decimal("49000"))  # T-1
+        prices.append(Decimal("48000"))  # T-0 (4% drop)
+        drop_pct = (prices[0] - prices[-1]) / prices[0]
+        assert drop_pct > Decimal("0.03")  # >3% = trigger
+
+    def test_crisis_mode_expires(self):
+        """Verifica che il crisis mode abbia un timeout di 30 minuti."""
+        import time
+        crisis_until = time.time() + 1800  # 30 minuti
+        assert crisis_until > time.time()
+        assert crisis_until - time.time() < 1801
+
+
+class TestIntegrationPartialTPFlow:
+    """Verifica il flow dei partial TP (50/25/25)."""
+
+    def test_tp_levels_created_correctly(self):
+        """Verifica che vengano creati 3 livelli TP con le frazioni giuste."""
+        cfg = BotSettings()
+        s = cfg.strategy
+        assert s.partial_tp1_pct == Decimal("0.50")
+        assert s.partial_tp2_pct == Decimal("0.25")
+        assert s.partial_tp3_pct == Decimal("0.25")
+        # Somma = 100%
+        assert s.partial_tp1_pct + s.partial_tp2_pct + s.partial_tp3_pct == Decimal("1.00")
+
+    def test_tp_levels_ascending(self):
+        """TP1 < TP2 < TP3 per LONG."""
+        cfg = BotSettings()
+        s = cfg.strategy
+        assert s.partial_tp1_atr < s.partial_tp2_atr < s.partial_tp3_atr

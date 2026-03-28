@@ -208,10 +208,39 @@ class SignalAggregator:
         strat_score = min((strat_weight - Decimal('0.5')) * Decimal('21.4'), Decimal('15'))
         strat_score = max(_ZERO, strat_score)
 
-        # Score contestuale (0-100)
-        context_score = trend_score + htf_score + confluence_score + vol_score + strat_score
+        # --- 6. MACD Momentum Confirmation (bonus/malus) ---
+        macd_bonus = _ZERO
+        try:
+            hist = self._ind.macd_histogram()
+            if signal.signal_type == SignalType.LONG and hist > _ZERO:
+                macd_bonus = Decimal('3')  # histogram positivo conferma LONG
+            elif signal.signal_type == SignalType.SHORT and hist < _ZERO:
+                macd_bonus = Decimal('3')  # histogram negativo conferma SHORT
+            # MACD divergence: forte segnale contrarian
+            if self._ind.macd_bearish_divergence() and signal.signal_type == SignalType.LONG:
+                macd_bonus = Decimal('-8')  # reversal imminente, penalizza LONG
+            elif self._ind.macd_bullish_divergence() and signal.signal_type == SignalType.SHORT:
+                macd_bonus = Decimal('-8')  # reversal imminente, penalizza SHORT
+        except ValueError:
+            pass
 
-        # Blend: 75% engine base + 25% contesto (engine signals sono calibrati, contesto è rumore)
+        # --- 7. StochRSI Entry Timing (bonus) ---
+        stoch_bonus = _ZERO
+        try:
+            if signal.signal_type == SignalType.LONG and self._ind.stoch_oversold_bounce():
+                stoch_bonus = Decimal('5')  # timing ottimale per LONG
+            elif signal.signal_type == SignalType.SHORT and self._ind.stoch_overbought_drop():
+                stoch_bonus = Decimal('5')  # timing ottimale per SHORT
+        except ValueError:
+            pass
+
+        # Score contestuale
+        context_score = (
+            trend_score + htf_score + confluence_score + vol_score + strat_score
+            + macd_bonus + stoch_bonus
+        )
+
+        # Blend: 75% engine base + 25% contesto
         blended = base * Decimal('0.75') + context_score * Decimal('0.25')
         final_score = max(_ZERO, min(blended, _HUNDRED))
         return final_score.quantize(Decimal('0.1'))

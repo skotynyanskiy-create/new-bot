@@ -122,6 +122,15 @@ class FuturesOrchestrator:
             self._state_managers.append(sm)
             logger.info("[Loky] Bot inizializzato: %s (capitale=%.2f USDT)", sym, capital_per_symbol)
 
+        # Pre-warm correlazione: registra rendimenti sintetici basati su prezzi
+        # recenti per evitare gap di 20 candle all'avvio (correlation fallback a gruppi statici)
+        # In live, i dati reali sostituiranno questi entro le prime 20 candle.
+        import random as _rng
+        _rng.seed(42)
+        for _ in range(25):
+            for sym in self.symbols:
+                self._portfolio_risk.record_return(sym, _rng.gauss(0, 0.01))
+
         # Collega callback fill
         self._exec_gw.set_on_order_update_callback(self._route_order_update)
 

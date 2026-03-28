@@ -338,8 +338,21 @@ class LokyBot:
             if not self._cfg.live_trading_enabled:
                 self._update_trailing_sl(candle)
                 await self._check_paper_tp_sl(candle)
+            # MACD divergence exit: se MACD diverge, chiudi anticipatamente (post-TP1)
+            if self._tp_levels and self._tp_levels[0].hit:
+                try:
+                    if is_long and self._indicators.macd_bearish_divergence():
+                        logger.info("%s MACD bearish divergence — exit anticipato", self.symbol)
+                        await self._close_remaining(candle.close, "macd_divergence")
+                        return
+                    if not is_long and self._indicators.macd_bullish_divergence():
+                        logger.info("%s MACD bullish divergence — exit anticipato", self.symbol)
+                        await self._close_remaining(candle.close, "macd_divergence")
+                        return
+                except ValueError:
+                    pass
+
             # Order Flow divergence exit: se CVD diverge dal prezzo, chiudi anticipatamente
-            # Solo dopo TP1 hit (posizione parziale residua)
             if self._tp_levels and self._tp_levels[0].hit:
                 price_rising = candle.close > self._entry_price if is_long else candle.close < self._entry_price
                 div = self._orderflow.divergence_signal(price_rising)
@@ -381,6 +394,10 @@ class LokyBot:
             return
 
         if self._state != BotState.FLAT:
+            return
+
+        # Blocco esplicito regime CHOPPY: nessun trade ammesso (ADX < 15)
+        if self._aggregator.is_choppy_market():
             return
 
         # Cooldown post-loss
@@ -526,13 +543,8 @@ class LokyBot:
             )
             return
 
-        # --- Portfolio risk check ---
-        if self._portfolio_risk is not None:
-            notional = best.entry_price * best.size
-            ok, reason = self._portfolio_risk.can_open(self.symbol, notional)
-            if not ok:
-                logger.info("%s Segnale bloccato da PortfolioRisk: %s", self.symbol, reason)
-                return
+        # Portfolio risk check spostato in _enter_position (DOPO Kelly/leverage adjustments)
+        # per verificare il notional EFFETTIVO, non quello pre-adjustment
 
         # --- Anti-martingale: aggiusta size in base al streak ---
         best.size = self._apply_streak_sizing(best.size)
@@ -921,6 +933,15 @@ class LokyBot:
             if heat_mod < Decimal('1'):
                 signal.size = (signal.size * heat_mod).quantize(Decimal('0.001'))
                 logger.debug("%s Portfolio heat: size ×%.1f", self.symbol, float(heat_mod))
+
+        # Portfolio risk check (POST size adjustments): verifica notional effettivo
+        if self._portfolio_risk is not None:
+            final_notional = signal.entry_price * signal.size
+            ok, reason = self._portfolio_risk.can_open(self.symbol, final_notional)
+            if not ok:
+                logger.info("%s Entry bloccata da PortfolioRisk (post-adj): %s", self.symbol, reason)
+                self._state = BotState.FLAT
+                return
 
         # Validazione size finale: blocca size invalide prima che arrivino al gateway
         min_notional = Decimal('6')   # Bybit minimum

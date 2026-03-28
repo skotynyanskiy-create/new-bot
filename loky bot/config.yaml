@@ -28,7 +28,7 @@ strategy:
   sl_atr_mult: 1.0
   max_hold_hours: 12
   trailing_stop_enabled: true
-  trail_atr_mult: 0.6
+  trail_atr_mult: 0.5
   loss_cooldown_candles: 3
 
   # --- ADX & Regime ---
@@ -53,13 +53,13 @@ strategy:
   # --- Funding Rate Harvesting ---
   funding_threshold: 0.0008      # 0.08% per 8h = attiva harvest
 
-  # --- Partial TP (50% TP1, 25% TP2, 25% trail) ---
-  partial_tp1_atr: 2.0
+  # --- Partial TP (10/10/80 — trailing dominance) ---
+  partial_tp1_atr: 1.8
   partial_tp2_atr: 3.0
   partial_tp3_atr: 5.0
-  partial_tp1_pct: 0.30
-  partial_tp2_pct: 0.30
-  partial_tp3_pct: 0.40
+  partial_tp1_pct: 0.10
+  partial_tp2_pct: 0.10
+  partial_tp3_pct: 0.80
 
   # --- Signal Scoring ---
   min_signal_score: 50           # score < 50 → segnale scartato (più trade)

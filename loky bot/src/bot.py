@@ -549,6 +549,8 @@ class LokyBot:
         if not self._htf_trend_aligned(best.signal_type):
             return False
 
+        # MACD è bonus score (non filtro hard) — è lagging, bloccherebbe breakout validi
+
         # --- Score minimo ---
         if best.score < self._cfg.strategy.min_signal_score:
             return False
@@ -764,12 +766,9 @@ class LokyBot:
             return
         if self._position_side is None or self._position_size == _ZERO:
             return
-        # Attiva trail solo DOPO almeno 1 partial TP (TP1 50%).
-        # Prima di TP1, lo SL è fisso e il prezzo deve raggiungere il primo target.
-        # Dopo TP1, lo SL è a breakeven e il trail protegge il residuo.
-        tp1_hit = self._tp_levels and self._tp_levels[0].hit
-        if not tp1_hit:
-            return
+        # Trail si attiva quando profitto > 1×ATR (protegge l'80% della posizione).
+        # Non richiede più TP1 hit — con split 10/10/80 il trailing deve proteggere
+        # la maggioranza della posizione indipendentemente dai partial TP.
         try:
             atr = self._indicators.atr()
         except ValueError:

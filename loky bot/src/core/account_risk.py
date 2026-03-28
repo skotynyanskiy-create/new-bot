@@ -44,6 +44,7 @@ class AccountRiskManager:
         self._max_dd_pct        = max_peak_drawdown_pct
         self._realized_pnl_day: Decimal = _ZERO
         self._realized_pnl_total: Decimal = _ZERO      # cumulativo dall'avvio
+        self._unrealized_pnl: Decimal = _ZERO           # PnL non realizzato posizioni aperte
         self._equity_peak: Decimal = initial_capital   # picco equity per drawdown
         self._initial_capital: Decimal = initial_capital
         self._open_symbols: Set[str]    = set()
@@ -60,11 +61,18 @@ class AccountRiskManager:
     # API pubblica
     # ------------------------------------------------------------------
 
+    def update_unrealized_pnl(self, unrealized: Decimal) -> None:
+        """
+        Aggiorna il PnL non realizzato delle posizioni aperte.
+        Chiamato periodicamente dall'orchestratore o dai bot.
+        """
+        self._unrealized_pnl = unrealized
+
     def can_open_position(self, symbol: str) -> bool:
         """
         Ritorna True se il bot può aprire una nuova posizione.
         Nega se:
-          • daily loss account-level è raggiunto
+          • daily loss account-level è raggiunto (realizzato + non realizzato)
           • drawdown dal picco equity supera max_peak_drawdown_pct
           • numero posizioni aperte >= max_concurrent
         """
@@ -76,6 +84,17 @@ class AccountRiskManager:
 
         if self._drawdown_stop:
             logger.warning("Peak drawdown stop attivo. Nessuna nuova posizione consentita.")
+            return False
+
+        # Controlla PnL giornaliero includendo perdite non realizzate
+        total_daily = self._realized_pnl_day + self._unrealized_pnl
+        if total_daily <= self._max_daily_loss and not self._stop_triggered:
+            logger.warning(
+                "ACCOUNT DAILY STOP (unrealized): PnL giorno=%.4f USDT "
+                "(realized=%.4f + unrealized=%.4f, limite=%.4f).",
+                total_daily, self._realized_pnl_day, self._unrealized_pnl, self._max_daily_loss,
+            )
+            self._stop_triggered = True
             return False
 
         if len(self._open_symbols) >= self._max_concurrent:

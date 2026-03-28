@@ -496,3 +496,60 @@ class TestKellyPartialExitFix:
         partial_locked_pnl = Decimal('0')
         risk_amount = max(gross_risk - partial_locked_pnl, gross_risk * Decimal('0.1'))
         assert risk_amount == Decimal('100')
+
+
+# ================================================================== #
+#  FASE 2 — RACE CONDITIONS & ROBUSTEZZA                              #
+# ================================================================== #
+
+class TestUnrealizedPnlDailyStop:
+    """Verifica che il daily stop consideri anche il PnL non realizzato."""
+
+    def test_unrealized_loss_triggers_daily_stop(self):
+        """Perdita non realizzata deve attivare il daily stop."""
+        arm = AccountRiskManager(
+            max_daily_loss_pct=Decimal("0.05"),
+            initial_capital=Decimal("1000"),
+        )
+        # Realized PnL: -20 (sotto soglia di -50)
+        arm.register_open("BTCUSDT")
+        arm.register_close("BTCUSDT", Decimal("-20"))
+        assert arm.can_open_position("ETHUSDT") is True  # -20 > -50, ok
+
+        # Aggiungi unrealized PnL di -35 → totale = -55 > -50 → stop
+        arm.update_unrealized_pnl(Decimal("-35"))
+        assert arm.can_open_position("SOLUSDT") is False
+
+    def test_unrealized_gain_doesnt_block(self):
+        """Guadagno non realizzato non deve bloccare il trading."""
+        arm = AccountRiskManager(
+            max_daily_loss_pct=Decimal("0.05"),
+            initial_capital=Decimal("1000"),
+        )
+        arm.update_unrealized_pnl(Decimal("50"))  # posizione in profitto
+        assert arm.can_open_position("BTCUSDT") is True
+
+
+class TestStatePersistenceAsync:
+    """Verifica che update_snapshot sia async e protetto dal lock."""
+
+    @pytest.mark.asyncio
+    async def test_update_snapshot_is_async(self):
+        import tempfile, shutil
+        from src.state.persistency import StateManager
+        tmp = tempfile.mkdtemp()
+        try:
+            sm = StateManager(db_path=f"{tmp}/test.db")
+            # Deve essere awaitable
+            await sm.update_snapshot(
+                net_inventory=Decimal("0.01"),
+                pnl=Decimal("5.0"),
+                avg_entry=Decimal("100"),
+                quotes_sent=0,
+                fills_total=1,
+            )
+            state = sm.load_state()
+            assert state is not None
+            assert state["pnl"] == Decimal("5.0")
+        finally:
+            shutil.rmtree(tmp)

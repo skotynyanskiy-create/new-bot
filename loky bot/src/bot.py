@@ -178,6 +178,7 @@ class LokyBot:
 
         self._candles: deque[Candle] = deque(maxlen=200)
         self._candle_count: int = 0       # contatore candle per polling funding rate
+        self._last_price: Decimal = _ZERO  # ultimo prezzo (close dell'ultima candle)
 
         # --- Macchina a stati ---
         self._state: BotState               = BotState.FLAT
@@ -260,6 +261,7 @@ class LokyBot:
         self._candles.append(candle)
         self._indicators.update(candle)
         self._candle_count += 1
+        self._last_price = candle.close
 
         # Registra ATR per leva dinamica
         if self._portfolio_risk is not None:
@@ -907,7 +909,7 @@ class LokyBot:
             ))
 
         self._start_hold_time_check()
-        self._save_state()
+        await self._save_state()
 
         if _prom:
             _position_gauge.labels(symbol=self.symbol).set(1)
@@ -1123,7 +1125,7 @@ class LokyBot:
             self._portfolio_risk.register_close(self.symbol)
 
         self._reset_position_state()
-        self._save_state()
+        await self._save_state()
 
     async def _exit_position_market(self, reason: str) -> None:
         """Chiude la posizione con ordine market (es. max hold time)."""
@@ -1188,6 +1190,13 @@ class LokyBot:
         fee = self._entry_price * size * entry_fee_rate + exit_price * size * self._cfg.fee_taker
         return gross - fee
 
+    @property
+    def unrealized_pnl(self) -> Decimal:
+        """PnL non realizzato della posizione aperta corrente."""
+        if self._position_size <= _ZERO or self._position_side is None:
+            return _ZERO
+        return self._calc_pnl_for_size(self._last_price, self._position_size)
+
     def _calc_paper_fill_price(
         self, base_price: Decimal, side: Side, size: Decimal
     ) -> Decimal:
@@ -1229,9 +1238,9 @@ class LokyBot:
     # Persistenza
     # ------------------------------------------------------------------
 
-    def _save_state(self) -> None:
+    async def _save_state(self) -> None:
         inv = self._position_size if self._position_side == Side.BUY else -self._position_size
-        self._state_mgr.update_snapshot(
+        await self._state_mgr.update_snapshot(
             net_inventory=inv,
             pnl=self.realized_pnl,
             avg_entry=self._entry_price,

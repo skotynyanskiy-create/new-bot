@@ -98,6 +98,8 @@ class FuturesOrchestrator:
         # Bot e state manager per ogni symbol
         self._bots: dict[str, LokyBot] = {}
         self._state_managers: list[StateManager] = []
+        # Lock per-symbol: serializza elaborazione candle per evitare race condition
+        self._candle_locks: dict[str, asyncio.Lock] = {s: asyncio.Lock() for s in self.symbols}
 
         for sym in self.symbols:
             sm  = StateManager(db_path=f"data/state_{sym}.db")
@@ -140,7 +142,18 @@ class FuturesOrchestrator:
         self._last_candle_time = time.time()   # aggiorna dead-man switch
         bot = self._bots.get(symbol)
         if bot:
-            await bot.on_candle(candle)
+            # Lock per-symbol: serializza elaborazione candle per evitare
+            # che due candle dello stesso symbol vengano processate in parallelo
+            lock = self._candle_locks.get(symbol)
+            if lock:
+                async with lock:
+                    await bot.on_candle(candle)
+            else:
+                await bot.on_candle(candle)
+
+            # Aggiorna PnL non realizzato nell'account risk manager
+            total_unrealized = sum(b.unrealized_pnl for b in self._bots.values())
+            self._account_risk.update_unrealized_pnl(total_unrealized)
 
     async def _route_order_update(self, order) -> None:
         bot = self._bots.get(order.symbol)

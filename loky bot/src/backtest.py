@@ -106,7 +106,7 @@ class _InMemoryStateManager:
     def load_state(self) -> None:
         return None
 
-    def update_snapshot(self, **kwargs) -> None:
+    async def update_snapshot(self, **kwargs) -> None:
         # Cattura entry_price dal bot state ad ogni snapshot update
         avg_entry = kwargs.get("avg_entry", None)
         if avg_entry is not None and avg_entry != Decimal("0"):

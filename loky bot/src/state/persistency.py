@@ -112,7 +112,7 @@ class StateManager:
     # ------------------------------------------------------------------
     # Aggiornamento snapshot (chiamato dal bot)
     # ------------------------------------------------------------------
-    def update_snapshot(
+    async def update_snapshot(
         self,
         net_inventory: Decimal,
         pnl: Decimal,
@@ -120,7 +120,7 @@ class StateManager:
         quotes_sent: int,
         fills_total: int,
     ) -> None:
-        """Aggiorna lo snapshot in memoria e lo persiste immediatamente."""
+        """Aggiorna lo snapshot in memoria e lo persiste immediatamente (async, thread-safe)."""
         self._snapshot = {
             "net_inventory": net_inventory,
             "pnl":           pnl,
@@ -128,9 +128,15 @@ class StateManager:
             "quotes_sent":   quotes_sent,
             "fills_total":   fills_total,
         }
-        self._write_snapshot()
+        await self._write_snapshot_locked()
 
-    def _write_snapshot(self) -> None:
+    async def _write_snapshot_locked(self) -> None:
+        """Scrive lo snapshot nel DB protetto dal lock condiviso con save_trade."""
+        async with self._db_lock:
+            self._write_snapshot_sync()
+
+    def _write_snapshot_sync(self) -> None:
+        """Scrittura sincrona dello snapshot (da usare sotto lock o in shutdown)."""
         try:
             s = self._snapshot
             with self._conn:
@@ -187,10 +193,10 @@ class StateManager:
             while True:
                 await asyncio.sleep(interval)
                 try:
-                    self._write_snapshot()
+                    await self._write_snapshot_locked()
                 except Exception as e:
                     logger.error("Auto-save error: %s", e)
         except asyncio.CancelledError:
             # Flush finale prima di spegnersi — non perdere fino a 30s di stato
-            self._write_snapshot()
+            self._write_snapshot_sync()
             logger.info("State Manager: flush finale completato.")

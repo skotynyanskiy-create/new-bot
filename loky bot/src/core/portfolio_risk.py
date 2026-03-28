@@ -158,34 +158,48 @@ class PortfolioRiskManager:
         # Clamp in [0, 1] per sicurezza numerica
         return max(_ZERO, min(Decimal('1'), percentile))
 
-    def dynamic_leverage(self, current_atr: Decimal) -> int:
+    def dynamic_leverage(
+        self, current_atr: Decimal, drawdown_pct: Decimal = _ZERO
+    ) -> int:
         """
-        Calcola la leva dinamica basata sul percentile ATR corrente.
+        Calcola la leva dinamica basata su ATR percentile e drawdown corrente.
 
-        atr_percentile > 0.80 → 3x  (alta volatilità)
-        atr_percentile 0.40-0.80 → 5x  (normale)
-        atr_percentile < 0.40 → 7x  (bassa volatilità)
+        ATR-based:
+          atr_percentile > 0.80 → 3x  (alta volatilità)
+          atr_percentile 0.40-0.80 → 5x  (normale)
+          atr_percentile < 0.40 → 7x  (bassa volatilità)
+
+        Drawdown override (più conservativo):
+          drawdown > 10% → max 1x (sopravvivenza)
+          drawdown > 5%  → dimezza la leva ATR-based
+          drawdown ≤ 5%  → leva ATR-based piena
 
         Falls back a max_leverage se non ci sono abbastanza dati.
         """
         if len(self._atr_history) < 20:
-            return min(self._max_leverage, 5)
-
-        # Usa la stessa mid-rank interpolation di atr_percentile per coerenza
-        percentile = self.atr_percentile(current_atr)
-
-        if percentile > Decimal('0.80'):
-            lev = 3
-        elif percentile > Decimal('0.40'):
-            lev = 5
+            base_lev = min(self._max_leverage, 5)
         else:
-            lev = 7
+            percentile = self.atr_percentile(current_atr)
+            if percentile > Decimal('0.80'):
+                base_lev = 3
+            elif percentile > Decimal('0.40'):
+                base_lev = 5
+            else:
+                base_lev = 7
+
+        # Drawdown override: riduce leva progressivamente
+        if drawdown_pct > Decimal('0.10'):
+            lev = 1  # sopravvivenza: leva minima
+        elif drawdown_pct > Decimal('0.05'):
+            lev = max(1, base_lev // 2)  # dimezza
+        else:
+            lev = base_lev
 
         # Rispetta comunque il cap configurato
         lev = min(lev, self._max_leverage)
         logger.debug(
-            "Leva dinamica: ATR=%.4f percentile=%.2f → %dx",
-            current_atr, float(percentile), lev,
+            "Leva dinamica: ATR percentile, drawdown=%.1f%% → %dx",
+            float(drawdown_pct * 100), lev,
         )
         return lev
 

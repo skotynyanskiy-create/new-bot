@@ -155,6 +155,15 @@ class FuturesOrchestrator:
             total_unrealized = sum(b.unrealized_pnl for b in self._bots.values())
             self._account_risk.update_unrealized_pnl(total_unrealized)
 
+            # Adatta il daily stop alla volatilità corrente (via ATR percentile)
+            try:
+                atr = bot._indicators.atr()
+                self._portfolio_risk.record_atr(atr)
+                vol_factor = self._portfolio_risk.atr_percentile(atr)
+                self._account_risk.adjust_daily_stop_for_volatility(vol_factor)
+            except (ValueError, AttributeError):
+                pass  # indicatori non ancora pronti
+
     async def _route_order_update(self, order) -> None:
         bot = self._bots.get(order.symbol)
         if bot:

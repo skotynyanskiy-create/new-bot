@@ -553,3 +553,108 @@ class TestStatePersistenceAsync:
             assert state["pnl"] == Decimal("5.0")
         finally:
             shutil.rmtree(tmp)
+
+
+# ================================================================== #
+#  FASE 3 — RISK MANAGEMENT AVANZATO                                  #
+# ================================================================== #
+
+class TestLiquidationMonitor:
+    """Verifica il calcolo del prezzo di liquidazione e gli alert."""
+
+    def test_long_liquidation_price(self):
+        from src.core.liquidation_monitor import LiquidationMonitor
+        mon = LiquidationMonitor(leverage=10)
+        # LONG liq_price = entry × (1 - 1/lev + mmr) = 100 × (1 - 0.1 + 0.005) = 90.5
+        liq = mon.liquidation_price(Decimal("100"), is_long=True)
+        assert Decimal("90") < liq < Decimal("91")
+
+    def test_short_liquidation_price(self):
+        from src.core.liquidation_monitor import LiquidationMonitor
+        mon = LiquidationMonitor(leverage=10)
+        # SHORT liq_price = entry × (1 + 1/lev - mmr) = 100 × (1 + 0.1 - 0.005) = 109.5
+        liq = mon.liquidation_price(Decimal("100"), is_long=False)
+        assert Decimal("109") < liq < Decimal("110")
+
+    def test_safe_alert(self):
+        from src.core.liquidation_monitor import LiquidationMonitor, LiquidationAlert
+        mon = LiquidationMonitor(leverage=5)
+        alert = mon.check(Decimal("100"), Decimal("100"), is_long=True)
+        assert alert == LiquidationAlert.SAFE
+
+    def test_critical_alert_near_liquidation(self):
+        from src.core.liquidation_monitor import LiquidationMonitor, LiquidationAlert
+        mon = LiquidationMonitor(leverage=5)
+        # LONG con leva 5: liq_price ≈ 80.5. Prezzo a 81 = margine ~3%
+        liq = mon.liquidation_price(Decimal("100"), is_long=True)
+        # Prezzo appena sopra il liq price = CRITICAL
+        alert = mon.check(Decimal("100"), liq + Decimal("0.5"), is_long=True)
+        assert alert == LiquidationAlert.CRITICAL
+
+    def test_margin_distance_pct(self):
+        from src.core.liquidation_monitor import LiquidationMonitor
+        mon = LiquidationMonitor(leverage=5)
+        # Al prezzo di entry: margine = 100%
+        pct = mon.margin_distance_pct(Decimal("100"), Decimal("100"), is_long=True)
+        assert pct == Decimal("1")  # 100%
+
+
+class TestDrawdownLeverageReduction:
+    """Verifica la riduzione graduata della leva su drawdown."""
+
+    def test_no_drawdown_full_leverage(self):
+        from src.core.portfolio_risk import PortfolioRiskManager
+        pm = PortfolioRiskManager(capital=Decimal("1000"), max_leverage=10)
+        # Popola ATR history
+        for i in range(30):
+            pm.record_atr(Decimal(str(1 + i * 0.01)))
+        lev = pm.dynamic_leverage(Decimal("1.15"), drawdown_pct=Decimal("0.02"))
+        assert lev > 1  # leva piena, no drawdown override
+
+    def test_drawdown_5pct_halves_leverage(self):
+        from src.core.portfolio_risk import PortfolioRiskManager
+        pm = PortfolioRiskManager(capital=Decimal("1000"), max_leverage=10)
+        for i in range(30):
+            pm.record_atr(Decimal(str(1 + i * 0.01)))
+        lev_normal = pm.dynamic_leverage(Decimal("1.15"), drawdown_pct=Decimal("0.02"))
+        lev_dd = pm.dynamic_leverage(Decimal("1.15"), drawdown_pct=Decimal("0.07"))
+        assert lev_dd <= lev_normal // 2 + 1  # dimezzato o meno
+
+    def test_drawdown_10pct_survival_mode(self):
+        from src.core.portfolio_risk import PortfolioRiskManager
+        pm = PortfolioRiskManager(capital=Decimal("1000"), max_leverage=10)
+        for i in range(30):
+            pm.record_atr(Decimal(str(1 + i * 0.01)))
+        lev = pm.dynamic_leverage(Decimal("1.15"), drawdown_pct=Decimal("0.12"))
+        assert lev == 1  # sopravvivenza
+
+
+class TestVolatilityAdjustedDailyStop:
+    """Verifica che il daily stop si adatti alla volatilità."""
+
+    def test_high_vol_tightens_stop(self):
+        arm = AccountRiskManager(
+            max_daily_loss_pct=Decimal("0.05"),
+            initial_capital=Decimal("1000"),
+        )
+        base = arm._max_daily_loss  # -50
+        arm.adjust_daily_stop_for_volatility(Decimal("0.85"))  # alta vol
+        assert arm._max_daily_loss > base  # più stretto (meno negativo = più vicino a 0)
+
+    def test_low_vol_widens_stop(self):
+        arm = AccountRiskManager(
+            max_daily_loss_pct=Decimal("0.05"),
+            initial_capital=Decimal("1000"),
+        )
+        base = arm._max_daily_loss  # -50
+        arm.adjust_daily_stop_for_volatility(Decimal("0.15"))  # bassa vol
+        assert arm._max_daily_loss < base  # più largo (più negativo)
+
+    def test_normal_vol_unchanged(self):
+        arm = AccountRiskManager(
+            max_daily_loss_pct=Decimal("0.05"),
+            initial_capital=Decimal("1000"),
+        )
+        base = arm._max_daily_loss
+        arm.adjust_daily_stop_for_volatility(Decimal("0.50"))  # vol media
+        assert arm._max_daily_loss == base

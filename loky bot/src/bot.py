@@ -32,6 +32,7 @@ except ImportError:
 from src.config import BotSettings
 from src.core.account_risk import AccountRiskManager
 from src.core.kelly_sizing import KellySizer
+from src.core.liquidation_monitor import LiquidationAlert, LiquidationMonitor
 from src.core.portfolio_risk import PortfolioRiskManager
 from src.models import Candle, Order, OrderStatus, Side, Signal, SignalType, TPLevel, Trade
 from src.notifications.telegram import TelegramNotifier
@@ -176,6 +177,9 @@ class LokyBot:
             max_fraction   = Decimal('0.03'),
         )
 
+        # --- Liquidation monitor ---
+        self._liq_monitor = LiquidationMonitor(leverage=config.leverage)
+
         self._candles: deque[Candle] = deque(maxlen=200)
         self._candle_count: int = 0       # contatore candle per polling funding rate
         self._last_price: Decimal = _ZERO  # ultimo prezzo (close dell'ultima candle)
@@ -270,8 +274,46 @@ class LokyBot:
             except ValueError:
                 pass
 
-        # Posizione aperta: trailing SL + controllo partial TP/SL + pyramid scaling-in
+        # Posizione aperta: liquidation check + trailing SL + partial TP/SL + scaling-in
         if self._state in (BotState.POSITION_OPEN, BotState.PARTIAL_EXIT):
+            # Liquidation monitor: chiudi se margine critico
+            is_long = self._position_side == Side.BUY
+            liq_alert = self._liq_monitor.check(
+                self._entry_price, candle.close, is_long, symbol=self.symbol,
+            )
+            if liq_alert == LiquidationAlert.CRITICAL:
+                logger.warning(
+                    "%s LIQUIDATION CRITICAL — chiusura emergenza a mercato.", self.symbol,
+                )
+                if self._notifier:
+                    self._fire_and_forget(self._notifier.info(
+                        f"🚨 <b>LIQUIDAZIONE IMMINENTE</b> {self.symbol} — "
+                        f"chiusura forzata a mercato."
+                    ))
+                await self._close_remaining(candle.close, "liquidation_critical")
+                return
+
+            # Gap protection: se la perdita supera 2x lo SL originale, chiudi forzatamente.
+            # Protegge da gap di prezzo e slippage estremo che oltrepassano lo SL.
+            if self._sl_price_orig > _ZERO and self._position_size > _ZERO:
+                sl_distance_orig = abs(self._entry_price - self._sl_price_orig)
+                if is_long:
+                    actual_loss_distance = self._entry_price - candle.close
+                else:
+                    actual_loss_distance = candle.close - self._entry_price
+                if actual_loss_distance > sl_distance_orig * Decimal('2'):
+                    logger.warning(
+                        "%s GAP PROTECTION — perdita %.4f > 2x SL originale %.4f. Chiusura forzata.",
+                        self.symbol, actual_loss_distance, sl_distance_orig,
+                    )
+                    if self._notifier:
+                        self._fire_and_forget(self._notifier.info(
+                            f"⚠️ <b>GAP PROTECTION</b> {self.symbol} — "
+                            f"perdita > 2x SL. Chiusura forzata."
+                        ))
+                    await self._close_remaining(candle.close, "gap_protection_2x_sl")
+                    return
+
             if not self._cfg.live_trading_enabled:
                 self._update_trailing_sl(candle)
                 await self._check_paper_tp_sl(candle)
@@ -726,7 +768,8 @@ class LokyBot:
         if self._cfg.dynamic_leverage_enabled and self._portfolio_risk is not None:
             try:
                 atr = self._indicators.atr()
-                dyn_lev = self._portfolio_risk.dynamic_leverage(atr)
+                dd_pct = self._account_risk.current_drawdown_pct if self._account_risk else _ZERO
+                dyn_lev = self._portfolio_risk.dynamic_leverage(atr, drawdown_pct=dd_pct)
                 max_notional = self._capital * Decimal(str(dyn_lev))
                 if signal.entry_price > _ZERO:
                     max_dyn_size = (max_notional / signal.entry_price).quantize(Decimal('0.001'))

@@ -39,7 +39,8 @@ class AccountRiskManager:
         initial_capital: Decimal = Decimal("500"),
     ) -> None:
         self._max_daily_loss_pct = max_daily_loss_pct
-        self._max_daily_loss    = -(initial_capital * max_daily_loss_pct)  # calcolato dal capitale
+        self._base_daily_loss   = -(initial_capital * max_daily_loss_pct)  # base dal capitale
+        self._max_daily_loss    = self._base_daily_loss                    # attivo (adattivo)
         self._max_concurrent    = max_concurrent_positions
         self._max_dd_pct        = max_peak_drawdown_pct
         self._realized_pnl_day: Decimal = _ZERO
@@ -67,6 +68,31 @@ class AccountRiskManager:
         Chiamato periodicamente dall'orchestratore o dai bot.
         """
         self._unrealized_pnl = unrealized
+
+    def adjust_daily_stop_for_volatility(self, vol_factor: Decimal) -> None:
+        """
+        Adatta il daily stop alla volatilità corrente del mercato.
+
+        vol_factor = ATR_percentile (0-1):
+          > 0.70 (alta vol)  → stringe il daily stop (×0.7)
+          0.30-0.70 (media)  → daily stop invariato (×1.0)
+          < 0.30 (bassa vol) → allarga il daily stop (×1.3)
+
+        Questo evita di bruciare il daily stop in mercati molto volatili
+        e permette più spazio in mercati tranquilli.
+        """
+        if vol_factor > Decimal('0.70'):
+            multiplier = Decimal('0.7')
+        elif vol_factor < Decimal('0.30'):
+            multiplier = Decimal('1.3')
+        else:
+            multiplier = Decimal('1.0')
+
+        self._max_daily_loss = self._base_daily_loss * multiplier
+        logger.debug(
+            "Daily stop adattivo: vol_factor=%.2f → multiplier=%.1f → limit=%.2f USDT",
+            float(vol_factor), float(multiplier), float(self._max_daily_loss),
+        )
 
     def can_open_position(self, symbol: str) -> bool:
         """

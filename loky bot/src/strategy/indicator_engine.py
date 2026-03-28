@@ -13,9 +13,10 @@ from typing import Optional
 from src.models import Candle
 
 
-_ZERO = Decimal('0')
-_ONE  = Decimal('1')
-_TWO  = Decimal('2')
+_ZERO    = Decimal('0')
+_ONE     = Decimal('1')
+_TWO     = Decimal('2')
+_HUNDRED = Decimal('100')
 
 # Periodi EMA Ribbon fissi
 _RIBBON_PERIODS = (8, 13, 21, 34, 55)

@@ -549,6 +549,22 @@ class LokyBot:
         if not self._htf_trend_aligned(best.signal_type):
             return False
 
+        # --- Trend bias: penalizza LONG in downtrend, SHORT in uptrend ---
+        # Se il macro (4h) è chiaramente in una direzione, riduci size del segnale opposto
+        try:
+            macro_fast = self._macro_indicators.ema_fast()
+            macro_slow = self._macro_indicators.ema_slow()
+            if macro_slow > _ZERO:
+                macro_spread = (macro_fast - macro_slow) / macro_slow
+                if best.signal_type == SignalType.LONG and macro_spread < Decimal('-0.005'):
+                    # Macro bearish forte: dimezza size LONG (segnale contro-trend)
+                    best.size = (best.size * Decimal('0.5')).quantize(Decimal('0.001'))
+                elif best.signal_type == SignalType.SHORT and macro_spread > Decimal('0.005'):
+                    # Macro bullish forte: dimezza size SHORT
+                    best.size = (best.size * Decimal('0.5')).quantize(Decimal('0.001'))
+        except ValueError:
+            pass
+
         # MACD è bonus score (non filtro hard) — è lagging, bloccherebbe breakout validi
 
         # --- Score minimo ---
@@ -598,6 +614,49 @@ class LokyBot:
             sig = self._trend_follow.detect(self._candles)
             if sig.signal_type != SignalType.NONE:
                 signals.append(sig)
+
+        # RSI Reversal: segnale contrarian su RSI estremo + StochRSI bounce
+        # Funziona in QUALSIASI regime — i reversal da ipervenduto sono universali
+        try:
+            rsi = self._indicators.rsi()
+            atr = self._indicators.atr()
+            price = self._candles[-1].close
+            if rsi < Decimal('25') and self._indicators.stoch_oversold_bounce():
+                # RSI estremo ipervenduto + StochRSI rimbalza → LONG reversal
+                entry = price
+                sl_dist = atr * Decimal('0.8')
+                from src.strategy.sizing import calc_risk_size
+                size = calc_risk_size(
+                    self._capital, self._cfg.risk_per_trade_pct,
+                    sl_dist, self._cfg.leverage, price,
+                )
+                if size > _ZERO:
+                    signals.append(Signal(
+                        symbol=self.symbol, signal_type=SignalType.LONG,
+                        entry_price=entry, take_profit=entry + atr * Decimal('2.5'),
+                        stop_loss=entry - sl_dist, size=size, atr=atr,
+                        timestamp=time.time(), score=Decimal('75'),
+                        strategy_name="rsi_reversal",
+                    ))
+            elif rsi > Decimal('75') and self._indicators.stoch_overbought_drop():
+                # RSI estremo ipercomprato + StochRSI scende → SHORT reversal
+                entry = price
+                sl_dist = atr * Decimal('0.8')
+                from src.strategy.sizing import calc_risk_size
+                size = calc_risk_size(
+                    self._capital, self._cfg.risk_per_trade_pct,
+                    sl_dist, self._cfg.leverage, price,
+                )
+                if size > _ZERO:
+                    signals.append(Signal(
+                        symbol=self.symbol, signal_type=SignalType.SHORT,
+                        entry_price=entry, take_profit=entry - atr * Decimal('2.5'),
+                        stop_loss=entry + sl_dist, size=size, atr=atr,
+                        timestamp=time.time(), score=Decimal('75'),
+                        strategy_name="rsi_reversal",
+                    ))
+        except ValueError:
+            pass
 
         logger.debug("%s Regime=%s segnali trovati=%d", self.symbol, regime, len(signals))
         return signals

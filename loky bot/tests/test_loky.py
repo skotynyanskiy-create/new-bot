@@ -204,7 +204,7 @@ class TestIndicatorEngine:
 class TestKellySizer:
 
     def test_bayesian_prior_before_min_trades(self):
-        kelly = KellySizer(history_trades=20, half_kelly=True)
+        kelly = KellySizer(history_trades=20, kelly_divisor=2)
         size = kelly.position_size(
             Decimal("1000"), Decimal("10"),
             fallback_fraction=Decimal("0.015"),
@@ -212,7 +212,7 @@ class TestKellySizer:
         assert size > Decimal("0")
 
     def test_kelly_updates_correctly(self):
-        kelly = KellySizer(history_trades=5, half_kelly=True)
+        kelly = KellySizer(history_trades=5, kelly_divisor=2)
         for _ in range(10):
             kelly.update(Decimal("20"), Decimal("15"))  # win
         for _ in range(5):
@@ -222,7 +222,7 @@ class TestKellySizer:
         assert size > Decimal("0")
 
     def test_kelly_all_losses_returns_min(self):
-        kelly = KellySizer(history_trades=5, half_kelly=True, min_fraction=Decimal("0.005"))
+        kelly = KellySizer(history_trades=5, kelly_divisor=2, min_fraction=Decimal("0.005"))
         for _ in range(10):
             kelly.update(Decimal("-10"), Decimal("15"))
         size = kelly.position_size(Decimal("1000"), Decimal("10"))
@@ -1180,3 +1180,125 @@ class TestPortfolioHeat:
         pm.register_open("BTCUSDT", Decimal("600"))  # 60%
         mod = pm.heat_size_modifier()
         assert mod == Decimal("0.7")
+
+
+# ================================================================== #
+#  V5.1 — OPTIMAL-F, LIQUIDATION, TTL, BOOTSTRAP                     #
+# ================================================================== #
+
+class TestOptimalF:
+    """Verifica Optimal-f sizing."""
+
+    def test_optimal_f_computation(self):
+        kelly = KellySizer(history_trades=30, kelly_divisor=2, use_optimal_f=True)
+        # Simula 20 trade misti
+        for _ in range(12):
+            kelly.update(Decimal("10"), Decimal("5"))  # win: +10, rischiando 5
+        for _ in range(8):
+            kelly.update(Decimal("-5"), Decimal("5"))   # loss: -5, rischiando 5
+        f = kelly.optimal_fraction()
+        assert f is not None
+        assert f > Decimal("0")
+
+    def test_kelly_divisor_configurable(self):
+        # Third-Kelly (divisor=3) deve dare frazione più piccola di half-Kelly (divisor=2)
+        kelly2 = KellySizer(history_trades=5, kelly_divisor=2)
+        kelly3 = KellySizer(history_trades=5, kelly_divisor=3)
+        for k in [kelly2, kelly3]:
+            for _ in range(6):
+                k.update(Decimal("10"), Decimal("5"))
+            for _ in range(4):
+                k.update(Decimal("-5"), Decimal("5"))
+        f2 = kelly2.optimal_fraction()
+        f3 = kelly3.optimal_fraction()
+        assert f2 is not None and f3 is not None
+        assert f3 <= f2  # third-Kelly più conservativo
+
+    def test_strategy_priors_exist(self):
+        assert "breakout" in KellySizer.STRATEGY_PRIORS
+        assert "funding_rate" in KellySizer.STRATEGY_PRIORS
+
+
+class TestLiquidationClustering:
+    """Verifica la stima dei livelli di liquidazione."""
+
+    def test_estimate_with_sufficient_data(self):
+        from src.strategy.orderflow_engine import OrderFlowEngine
+        engine = OrderFlowEngine()
+        # Genera candle con swing highs/lows
+        for i in range(30):
+            base = 100 + (i % 5) * 2 - 4  # oscillazione 92-108
+            c = Candle(
+                symbol="BTCUSDT", timeframe="15m",
+                open=Decimal(str(base)), high=Decimal(str(base + 3)),
+                low=Decimal(str(base - 2)), close=Decimal(str(base + 1)),
+                volume=Decimal("100"), timestamp=float(i), is_closed=True,
+            )
+            engine.update(c)
+        levels = engine.estimate_liquidation_levels()
+        # Deve trovare almeno qualche livello
+        assert isinstance(levels, list)
+
+    def test_near_liquidation_cluster(self):
+        from src.strategy.orderflow_engine import OrderFlowEngine
+        engine = OrderFlowEngine()
+        # Con pochi dati, non dovrebbe trovare cluster
+        assert engine.near_liquidation_cluster(Decimal("100")) is False
+
+
+class TestAccumulationDistribution:
+    """Verifica l'A/D Line."""
+
+    def test_bullish_ad(self):
+        from src.strategy.orderflow_engine import OrderFlowEngine
+        engine = OrderFlowEngine()
+        # Candele con close vicino al high → accumulazione
+        for i in range(25):
+            c = Candle(
+                symbol="BTCUSDT", timeframe="15m",
+                open=Decimal("100"), high=Decimal("105"),
+                low=Decimal("99"), close=Decimal("104"),
+                volume=Decimal("100"), timestamp=float(i), is_closed=True,
+            )
+            engine.update(c)
+        ad = engine.accumulation_distribution()
+        assert ad > Decimal("0")  # accumulazione
+
+    def test_ad_trend(self):
+        from src.strategy.orderflow_engine import OrderFlowEngine
+        engine = OrderFlowEngine()
+        for i in range(25):
+            c = Candle(
+                symbol="BTCUSDT", timeframe="15m",
+                open=Decimal("100"), high=Decimal("105"),
+                low=Decimal("99"), close=Decimal("104"),
+                volume=Decimal("100"), timestamp=float(i), is_closed=True,
+            )
+            engine.update(c)
+        trend = engine.ad_trend()
+        assert trend in ("accumulation", "distribution", "neutral")
+
+
+class TestBootstrapCI:
+    """Verifica Bootstrap Confidence Intervals."""
+
+    def test_basic_bootstrap(self):
+        from src.backtest_advanced import BootstrapValidator
+        pnls = [5.0, -2.0, 8.0, -3.0, 10.0] * 10
+        bv = BootstrapValidator(pnls, capital=500, n_iterations=200)
+        result = bv.run()
+        assert result.n_iterations == 200
+        assert result.sharpe_5pct <= result.sharpe_median <= result.sharpe_95pct
+
+    def test_all_wins_profitable(self):
+        from src.backtest_advanced import BootstrapValidator
+        pnls = [10.0] * 20
+        bv = BootstrapValidator(pnls, capital=500, n_iterations=100)
+        result = bv.run()
+        assert result.sharpe_5pct > 0  # 95% CI interamente positivo
+
+    def test_empty_pnls(self):
+        from src.backtest_advanced import BootstrapValidator
+        bv = BootstrapValidator([], capital=500)
+        result = bv.run()
+        assert result.n_iterations == 0

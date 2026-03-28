@@ -190,9 +190,10 @@ class LokyBot:
         # --- Kelly Criterion sizing ---
         self._kelly = KellySizer(
             history_trades = config.kelly_min_trades,
-            half_kelly     = True,
+            kelly_divisor  = 2,           # half-Kelly (configurabile: 1=full, 3=third, 4=quarter)
             min_fraction   = Decimal('0.005'),
             max_fraction   = Decimal('0.03'),
+            use_optimal_f  = True,        # Optimal-f per fat tails crypto
         )
 
         # --- Liquidation monitor ---
@@ -726,6 +727,31 @@ class LokyBot:
                 sl_fill = self._calc_paper_fill_price(sl, exit_side, self._position_size)
                 await self._close_remaining(sl_fill, "SL hit (paper)")
                 return
+
+        # --- TTL-based TP scaling: target si stringono col tempo ---
+        # Dopo 2/3 del max hold time, chiudi qualsiasi profitto > 0.5×ATR
+        if self._entry_time > 0:
+            hold_seconds = time.time() - self._entry_time
+            max_hold_s = self._cfg.strategy.max_hold_hours * 3600
+            hold_ratio = hold_seconds / max_hold_s if max_hold_s > 0 else 0
+
+            if hold_ratio > 0.66:  # ultimi 33% del tempo
+                try:
+                    atr = self._indicators.atr()
+                    min_profit_to_exit = atr * Decimal('0.5')
+                    if is_long:
+                        profit = candle.close - self._entry_price
+                    else:
+                        profit = self._entry_price - candle.close
+                    if profit > min_profit_to_exit:
+                        logger.info(
+                            "%s TTL exit: hold %.0f%%, profit %.4f > 0.5×ATR. Chiusura.",
+                            self.symbol, hold_ratio * 100, profit,
+                        )
+                        await self._close_remaining(candle.close, "ttl_profit_exit")
+                        return
+                except ValueError:
+                    pass
 
         # --- Partial TP levels ---
         for i, tp_lvl in enumerate(self._tp_levels):

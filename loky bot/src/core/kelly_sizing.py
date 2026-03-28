@@ -50,26 +50,38 @@ class KellySizer:
         prior_win_ratio   — R:R prior bayesiano (default 1.5)
     """
 
+    # Prior per strategia: win_rate e R:R tipici per ogni tipo di strategia
+    STRATEGY_PRIORS = {
+        "breakout":        (Decimal('0.40'), Decimal('2.5')),
+        "mean_reversion":  (Decimal('0.55'), Decimal('1.2')),
+        "trend_following": (Decimal('0.45'), Decimal('2.0')),
+        "funding_rate":    (Decimal('0.70'), Decimal('0.8')),
+    }
+
     def __init__(
         self,
         history_trades: int = 30,
-        half_kelly: bool = True,
+        kelly_divisor: int = 2,
         min_fraction: Decimal = Decimal('0.005'),
         max_fraction: Decimal = Decimal('0.03'),
         prior_win_rate: Decimal = Decimal('0.45'),
         prior_win_ratio: Decimal = Decimal('1.5'),
+        use_optimal_f: bool = False,
     ) -> None:
         self._history_trades  = history_trades
-        self._half_kelly      = half_kelly
+        self._kelly_divisor   = max(1, kelly_divisor)  # 1=full, 2=half, 3=third, 4=quarter
         self._min_fraction    = min_fraction
         self._max_fraction    = max_fraction
         self._prior_win_rate  = prior_win_rate
         self._prior_win_ratio = prior_win_ratio
-        self._blend_threshold = max(history_trades // 2, 5)  # trade per blending completo
+        self._use_optimal_f   = use_optimal_f
+        self._blend_threshold = max(history_trades // 2, 5)
 
         # Rolling history di (pnl, risk_amount) per ogni trade
         self._pnls:    deque[Decimal] = deque(maxlen=history_trades)
         self._risks:   deque[Decimal] = deque(maxlen=history_trades)
+        # Returns normalizzati per Optimal-f
+        self._returns: deque[float] = deque(maxlen=history_trades)
 
     # ------------------------------------------------------------------
     # Update
@@ -85,6 +97,9 @@ class KellySizer:
         """
         self._pnls.append(pnl)
         self._risks.append(risk_amount if risk_amount > _ZERO else _ONE)
+        # Return normalizzato per Optimal-f: pnl / risk_amount
+        ra = risk_amount if risk_amount > _ZERO else _ONE
+        self._returns.append(float(pnl / ra))
 
     # ------------------------------------------------------------------
     # Calcolo frazione ottimale
@@ -147,17 +162,60 @@ class KellySizer:
             )
             return self._min_fraction
 
-        if self._half_kelly:
-            kelly_f = kelly_f / _TWO
+        # Optimal-f override: usa ricerca numerica se abilitato e dati sufficienti
+        if self._use_optimal_f and n >= 15:
+            opt_f = self._compute_optimal_f()
+            if opt_f is not None and opt_f > _ZERO:
+                # Optimal-f / 3 per safety (equivalente a third-Kelly per fat tails)
+                kelly_f = opt_f / Decimal('3')
+            else:
+                kelly_f = kelly_f / Decimal(str(self._kelly_divisor))
+        else:
+            kelly_f = kelly_f / Decimal(str(self._kelly_divisor))
 
         # Clamp tra min e max
         result = max(self._min_fraction, min(kelly_f, self._max_fraction))
         logger.debug(
-            "Kelly (n=%d blend=%.2f): p=%.2f R=%.2f f*=%.4f → clamped=%.4f",
-            n, float(blend_weight), float(p), float(avg_win_ratio),
-            float(kelly_f * _TWO), float(result),
+            "Kelly (n=%d blend=%.2f div=%d optf=%s): p=%.2f R=%.2f → f=%.4f",
+            n, float(blend_weight), self._kelly_divisor,
+            self._use_optimal_f, float(p), float(avg_win_ratio), float(result),
         )
         return result
+
+    def _compute_optimal_f(self) -> Optional[Decimal]:
+        """
+        Optimal-f (Ralph Vince): trova la f che massimizza il TWR
+        (Terminal Wealth Relative) sulla sequenza di trade reali.
+
+        Più robusto del Kelly classico per distribuzioni fat-tail (crypto).
+        Cerca la f in [0.01, 0.50] che massimizza il prodotto:
+          TWR = product(1 + f × return_i) per tutti i trade
+
+        Se qualsiasi (1 + f × return_i) < 0 → f troppo alto, skip.
+        """
+        returns = list(self._returns)
+        if len(returns) < 10:
+            return None
+
+        best_f = Decimal('0.01')
+        best_twr = Decimal('0')
+
+        # Cerca in step di 0.01 da 0.01 a 0.50
+        for f_int in range(1, 51):
+            f = f_int / 100.0
+            twr = 1.0
+            valid = True
+            for r in returns:
+                hpr = 1.0 + f * r
+                if hpr <= 0:
+                    valid = False
+                    break
+                twr *= hpr
+            if valid and twr > float(best_twr):
+                best_twr = Decimal(str(twr))
+                best_f = Decimal(str(f))
+
+        return best_f if best_twr > _ONE else None
 
     # ------------------------------------------------------------------
     # Position size

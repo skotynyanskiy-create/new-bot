@@ -292,3 +292,124 @@ class WalkForwardAnalyzer:
         else:
             print("  Verdetto: OVERFITTED — richiede ricalibrazione")
         print()
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap Confidence Intervals
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BootstrapResult:
+    """Risultato di una bootstrap analysis."""
+    n_iterations: int
+    sharpe_5pct: float
+    sharpe_median: float
+    sharpe_95pct: float
+    pnl_5pct: float
+    pnl_median: float
+    pnl_95pct: float
+    max_dd_median: float
+    max_dd_95pct: float
+
+
+class BootstrapValidator:
+    """
+    Resample trade PnLs con replacement per stimare la distribuzione reale.
+
+    Più robusto del Monte Carlo per campioni piccoli (< 100 trade):
+    preserva la distribuzione empirica senza assumere indipendenza.
+
+    Args:
+        trade_pnls — lista di PnL per trade
+        capital — capitale iniziale
+        n_iterations — numero di resample (default 1000)
+    """
+
+    def __init__(
+        self,
+        trade_pnls: List[float],
+        capital: float = 500.0,
+        n_iterations: int = 1000,
+    ) -> None:
+        self._pnls = trade_pnls
+        self._capital = capital
+        self._n_iter = n_iterations
+
+    def run(self, seed: int = 42) -> BootstrapResult:
+        if not self._pnls:
+            return BootstrapResult(0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+        rng = random.Random(seed)
+        n = len(self._pnls)
+        sharpes: List[float] = []
+        total_pnls: List[float] = []
+        max_dds: List[float] = []
+
+        for _ in range(self._n_iter):
+            # Resample CON replacement
+            sample = [rng.choice(self._pnls) for _ in range(n)]
+
+            # PnL totale
+            total = sum(sample)
+            total_pnls.append(total)
+
+            # Sharpe (annualizzato su 15m candles = 35040 periodi/anno)
+            if len(sample) > 1:
+                mu = total / len(sample)
+                var = sum((x - mu) ** 2 for x in sample) / (len(sample) - 1)
+                sigma = math.sqrt(var) if var > 0 else 1e-10
+                sharpe = mu / sigma * math.sqrt(35040)
+            else:
+                sharpe = 0.0
+            sharpes.append(sharpe)
+
+            # Max drawdown
+            equity = self._capital
+            peak = equity
+            max_dd = 0.0
+            for pnl in sample:
+                equity += pnl
+                if equity > peak:
+                    peak = equity
+                dd = (peak - equity) / peak if peak > 0 else 0
+                if dd > max_dd:
+                    max_dd = dd
+            max_dds.append(max_dd * 100)
+
+        sharpes.sort()
+        total_pnls.sort()
+        max_dds.sort()
+        m = len(sharpes)
+
+        return BootstrapResult(
+            n_iterations=self._n_iter,
+            sharpe_5pct=sharpes[int(m * 0.05)],
+            sharpe_median=sharpes[m // 2],
+            sharpe_95pct=sharpes[int(m * 0.95)],
+            pnl_5pct=total_pnls[int(m * 0.05)],
+            pnl_median=total_pnls[m // 2],
+            pnl_95pct=total_pnls[int(m * 0.95)],
+            max_dd_median=max_dds[m // 2],
+            max_dd_95pct=max_dds[int(m * 0.95)],
+        )
+
+    def print_report(self, result: Optional[BootstrapResult] = None) -> None:
+        r = result or self.run()
+        w = 55
+        print("\n" + "=" * w)
+        print(f"  BOOTSTRAP — {r.n_iterations} resample")
+        print("=" * w)
+        print(f"  Sharpe 95% CI     : [{r.sharpe_5pct:.2f}, {r.sharpe_95pct:.2f}]")
+        print(f"  Sharpe mediano    : {r.sharpe_median:.2f}")
+        print(f"  PnL 95% CI        : [{r.pnl_5pct:+.2f}, {r.pnl_95pct:+.2f}] USDT")
+        print(f"  PnL mediano       : {r.pnl_median:+.2f} USDT")
+        print(f"  Max DD mediano    : {r.max_dd_median:.1f}%")
+        print(f"  Max DD 95° pctile : {r.max_dd_95pct:.1f}%")
+        print("=" * w)
+        if r.sharpe_5pct > 0:
+            print("  Verdetto: STATISTICAMENTE PROFITTEVOLE (95% CI > 0)")
+        elif r.sharpe_median > 0:
+            print("  Verdetto: PROBABILMENTE PROFITTEVOLE (mediano > 0)")
+        else:
+            print("  Verdetto: NON PROFITTEVOLE — richiede ottimizzazione")
+        print()

@@ -187,3 +187,136 @@ class OrderFlowEngine:
             return Decimal('0.85')
 
         return Decimal('1.0')
+
+    # ------------------------------------------------------------------
+    # Liquidation Level Clustering
+    # ------------------------------------------------------------------
+
+    def estimate_liquidation_levels(
+        self, lookback: int = 100, leverage_common: list[int] | None = None
+    ) -> list[Decimal]:
+        """
+        Stima dove si concentrano i livelli di liquidazione degli altri trader.
+
+        Logica: i trader usano tipicamente leve 5x, 10x, 25x.
+        Per ogni swing high/low recente, calcola dove sarebbero i liq price
+        per chi è entrato long/short a quel livello con leve comuni.
+
+        Returns: lista dei top 5 livelli di liquidazione più probabili.
+        """
+        candles = list(self._candle_history)[-lookback:]
+        if len(candles) < 20:
+            return []
+
+        levers = leverage_common or [5, 10, 25]
+        liq_levels: list[Decimal] = []
+
+        # Trova swing high/low come probabili punti di entry degli altri trader
+        for i in range(2, len(candles) - 2):
+            c = candles[i]
+            # Swing high: potenziale entry SHORT degli altri → liq sopra
+            if c.high > candles[i-1].high and c.high > candles[i+1].high:
+                for lev in levers:
+                    # SHORT entry al swing high → liquidazione = entry × (1 + 1/lev)
+                    liq = c.high * (Decimal('1') + Decimal('1') / Decimal(str(lev)))
+                    liq_levels.append(liq)
+            # Swing low: potenziale entry LONG degli altri → liq sotto
+            if c.low < candles[i-1].low and c.low < candles[i+1].low:
+                for lev in levers:
+                    # LONG entry al swing low → liquidazione = entry × (1 - 1/lev)
+                    liq = c.low * (Decimal('1') - Decimal('1') / Decimal(str(lev)))
+                    liq_levels.append(liq)
+
+        if not liq_levels:
+            return []
+
+        # Clusterizza livelli vicini (entro 0.5%)
+        return self._cluster_levels(liq_levels, tolerance_pct=Decimal('0.005'))[:5]
+
+    def _cluster_levels(
+        self, levels: list[Decimal], tolerance_pct: Decimal
+    ) -> list[Decimal]:
+        """Raggruppa livelli vicini e ritorna i centri dei cluster più densi."""
+        if not levels:
+            return []
+        sorted_levels = sorted(levels)
+        clusters: list[list[Decimal]] = [[sorted_levels[0]]]
+        for price in sorted_levels[1:]:
+            ref = clusters[-1][0]
+            if ref > _ZERO and abs(price - ref) / ref <= tolerance_pct:
+                clusters[-1].append(price)
+            else:
+                clusters.append([price])
+
+        # Ordina per densità (cluster più denso = più probabile)
+        clusters.sort(key=len, reverse=True)
+        return [
+            sum(c) / Decimal(len(c))  # media del cluster
+            for c in clusters
+        ]
+
+    def near_liquidation_cluster(
+        self, current_price: Decimal, distance_pct: Decimal = Decimal('0.02')
+    ) -> bool:
+        """
+        True se il prezzo corrente è entro distance_pct da un cluster di liquidazione.
+        Utile per evitare entry vicino a cascate di liquidazione.
+        """
+        levels = self.estimate_liquidation_levels()
+        for lev in levels:
+            if lev > _ZERO and abs(current_price - lev) / lev < distance_pct:
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Accumulation/Distribution Line
+    # ------------------------------------------------------------------
+
+    def accumulation_distribution(self, lookback: int = 50) -> Decimal:
+        """
+        A/D Line = sum of CLV × Volume
+
+        CLV (Close Location Value) = (Close - Low - (High - Close)) / (High - Low)
+        Varia da -1 (close = low, distribuzione) a +1 (close = high, accumulazione).
+
+        Interpretazione:
+          A/D crescente + prezzo sale = accumulazione confermata (strong trend)
+          A/D crescente + prezzo scende = accumulazione nascosta (smart money, reversal)
+          A/D decrescente + prezzo sale = distribuzione (trap, exit soon)
+        """
+        candles = list(self._candle_history)[-lookback:]
+        ad_sum = _ZERO
+        for c in candles:
+            hl_range = c.high - c.low
+            if hl_range <= _ZERO:
+                continue
+            clv = (c.close - c.low - (c.high - c.close)) / hl_range
+            ad_sum += clv * c.volume
+        return ad_sum
+
+    def ad_trend(self, lookback: int = 50) -> str:
+        """
+        Trend dell'A/D Line: 'accumulation', 'distribution', 'neutral'.
+        Confronta A/D prima metà vs seconda metà.
+        """
+        candles = list(self._candle_history)[-lookback:]
+        if len(candles) < 20:
+            return "neutral"
+        mid = len(candles) // 2
+        first = _ZERO
+        second = _ZERO
+        for c in candles[:mid]:
+            hl = c.high - c.low
+            if hl > _ZERO:
+                first += ((c.close - c.low - (c.high - c.close)) / hl) * c.volume
+        for c in candles[mid:]:
+            hl = c.high - c.low
+            if hl > _ZERO:
+                second += ((c.close - c.low - (c.high - c.close)) / hl) * c.volume
+        diff = second - first
+        threshold = abs(first + second) * Decimal('0.1')
+        if diff > threshold:
+            return "accumulation"
+        elif diff < -threshold:
+            return "distribution"
+        return "neutral"

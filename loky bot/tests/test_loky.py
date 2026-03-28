@@ -949,29 +949,27 @@ class TestBreakoutMultiCandleConfirmation:
 class TestDailyStopCarryOver:
     """Verifica che il daily stop porti avanti le perdite non realizzate cross-midnight."""
 
-    def test_carry_over_negative_unrealized(self):
+    def test_no_carry_over_prevents_double_counting(self):
+        """Unrealized losses NON vengono carry-over per evitare double-counting."""
         arm = AccountRiskManager(
             max_daily_loss_pct=Decimal("0.05"),
             initial_capital=Decimal("1000"),
         )
-        # Simula perdita non realizzata
         arm.update_unrealized_pnl(Decimal("-20"))
-        # Forza reset giornaliero
-        arm._day_start = 0  # forza il reset
+        arm._day_start = 0  # forza reset
         arm._maybe_reset_daily()
-        # Il daily PnL deve partire da -20 (carry-over)
-        assert arm._realized_pnl_day == Decimal("-20")
+        # Reset pulito: nessun carry-over (il check real-time include unrealized)
+        assert arm._realized_pnl_day == Decimal("0")
 
-    def test_carry_over_positive_unrealized_ignored(self):
+    def test_unrealized_still_blocks_via_can_open(self):
+        """Le perdite unrealized bloccano via can_open_position (check real-time)."""
         arm = AccountRiskManager(
             max_daily_loss_pct=Decimal("0.05"),
             initial_capital=Decimal("1000"),
         )
-        # Guadagno non realizzato: non deve essere carry-over
-        arm.update_unrealized_pnl(Decimal("30"))
-        arm._day_start = 0
-        arm._maybe_reset_daily()
-        assert arm._realized_pnl_day == Decimal("0")
+        # -60 unrealized supera il limite di -50 (5% di 1000)
+        arm.update_unrealized_pnl(Decimal("-60"))
+        assert arm.can_open_position("BTCUSDT") is False
 
 
 # ================================================================== #
@@ -1302,3 +1300,122 @@ class TestBootstrapCI:
         bv = BootstrapValidator([], capital=500)
         result = bv.run()
         assert result.n_iterations == 0
+
+
+# ================================================================== #
+#  V5.2 — PRECISION, REASONING, ZERO-ERROR                           #
+# ================================================================== #
+
+class TestCVDDeltaFixed:
+    """Verifica che il CVD delta sia corretto per candele rosse."""
+
+    def test_red_candle_close_at_low_zero_buy(self):
+        """Candela rossa con close=low: buy_ratio deve essere ~0."""
+        from src.strategy.orderflow_engine import OrderFlowEngine
+        engine = OrderFlowEngine()
+        c = Candle(
+            symbol="BTCUSDT", timeframe="15m",
+            open=Decimal("100"), high=Decimal("102"),
+            low=Decimal("95"), close=Decimal("95"),  # close = low
+            volume=Decimal("1000"), timestamp=1.0, is_closed=True,
+        )
+        engine.update(c)
+        # Delta deve essere fortemente negativo (tutta sell pressure)
+        assert engine.current_delta < Decimal("0")
+
+    def test_green_candle_close_at_high_full_buy(self):
+        """Candela verde con close=high: buy_ratio deve essere ~1."""
+        from src.strategy.orderflow_engine import OrderFlowEngine
+        engine = OrderFlowEngine()
+        c = Candle(
+            symbol="BTCUSDT", timeframe="15m",
+            open=Decimal("95"), high=Decimal("102"),
+            low=Decimal("95"), close=Decimal("102"),  # close = high
+            volume=Decimal("1000"), timestamp=1.0, is_closed=True,
+        )
+        engine.update(c)
+        assert engine.current_delta > Decimal("0")
+
+    def test_doji_returns_zero_delta(self):
+        """Doji (hl_range tiny): delta deve essere zero."""
+        from src.strategy.orderflow_engine import OrderFlowEngine
+        engine = OrderFlowEngine()
+        c = Candle(
+            symbol="BTCUSDT", timeframe="15m",
+            open=Decimal("100.00"), high=Decimal("100.005"),
+            low=Decimal("100.00"), close=Decimal("100.003"),
+            volume=Decimal("1000"), timestamp=1.0, is_closed=True,
+        )
+        engine.update(c)
+        assert engine.current_delta == Decimal("0")
+
+
+class TestMACDDivergence:
+    """Verifica MACD e divergence detection."""
+
+    def test_macd_computes_after_26_candles(self):
+        ind = IndicatorEngine()
+        candles = make_candles(30)
+        for c in candles:
+            ind.update(c)
+        macd = ind.macd()
+        assert isinstance(macd, Decimal)
+
+    def test_macd_histogram(self):
+        ind = IndicatorEngine()
+        candles = make_candles(30)
+        for c in candles:
+            ind.update(c)
+        hist = ind.macd_histogram()
+        assert isinstance(hist, Decimal)
+
+
+class TestStochasticRSI:
+    """Verifica Stochastic RSI."""
+
+    def test_stoch_rsi_after_enough_data(self):
+        ind = IndicatorEngine()
+        candles = make_candles(60)
+        for c in candles:
+            ind.update(c)
+        stoch = ind.stoch_rsi()
+        assert Decimal("0") <= stoch <= Decimal("100")
+
+    def test_stoch_k_d_available(self):
+        ind = IndicatorEngine()
+        candles = make_candles(60)
+        for c in candles:
+            ind.update(c)
+        k = ind.stoch_k()
+        d = ind.stoch_d()
+        assert isinstance(k, Decimal)
+        assert isinstance(d, Decimal)
+
+
+class TestRegimeHysteresis:
+    """Verifica che il regime non flip-floppi."""
+
+    def test_regime_locked_for_minimum_candles(self):
+        from src.strategy.volatility_engine import VolatilityRegimeEngine, VolatilityRegime
+        ind = IndicatorEngine()
+        engine = VolatilityRegimeEngine(ind, lock_candles=5)
+        # Senza dati → NORMAL, lock per 5 candle
+        for _ in range(3):
+            engine.update()
+            r = engine.detect()
+        # Regime deve restare NORMAL durante il lock
+        assert r == VolatilityRegime.NORMAL
+
+
+class TestMLScorerHardened:
+    """Verifica ML Scorer con weight clipping e decay."""
+
+    def test_weights_clipped(self):
+        from src.strategy.ml_scorer import MLScorer
+        ml = MLScorer(min_trades=3, learning_rate=1.0, weight_clip=3.0)
+        # Learning rate altissimo per forzare overflow
+        for _ in range(50):
+            ml.update([10.0]*8, won=True)
+        # I pesi devono essere clipped a [-3, +3]
+        assert all(-3.0 <= w <= 3.0 for w in ml._weights)
+        assert -3.0 <= ml._bias <= 3.0

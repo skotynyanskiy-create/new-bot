@@ -38,12 +38,14 @@ class MLScorer:
         self,
         n_features: int = 8,
         learning_rate: float = 0.01,
-        weight_decay: float = 0.001,
+        weight_decay: float = 0.05,
         min_trades: int = 30,
+        weight_clip: float = 3.0,
     ) -> None:
         self._n_features = n_features
         self._lr = learning_rate
         self._wd = weight_decay
+        self._weight_clip = weight_clip
         self._min_trades = min_trades
 
         # Pesi inizializzati a zero (prior neutro)
@@ -63,24 +65,29 @@ class MLScorer:
         return 1.0 / (1.0 + math.exp(-x))
 
     def _normalize(self, features: list[float]) -> list[float]:
-        """Z-score normalization con running stats."""
+        """Z-score normalization con running stats + clipping."""
         if self._n_samples < 5:
             return features
         return [
-            (f - self._feature_means[i]) / max(math.sqrt(self._feature_vars[i]), 1e-8)
+            max(-self._weight_clip, min(self._weight_clip,
+                (f - self._feature_means[i]) / max(math.sqrt(self._feature_vars[i]), 1e-8)
+            ))
             for i, f in enumerate(features)
         ]
 
     def _update_running_stats(self, features: list[float]) -> None:
-        """Welford's online algorithm per mean e variance."""
+        """Welford's online algorithm per mean e variance (con guard div/0)."""
         self._n_samples += 1
         n = self._n_samples
         for i, f in enumerate(features):
             old_mean = self._feature_means[i]
             self._feature_means[i] += (f - old_mean) / n
-            self._feature_vars[i] += (f - old_mean) * (f - self._feature_means[i])
-            if n > 1:
-                self._feature_vars[i] = self._feature_vars[i] / (n - 1) if n > 1 else 1.0
+            delta_new = f - self._feature_means[i]
+            self._feature_vars[i] += (f - old_mean) * delta_new
+        # Varianza campionaria: dividi per (n-1), solo se n > 1
+        if n > 1:
+            for i in range(self._n_features):
+                self._feature_vars[i] = max(1e-10, self._feature_vars[i] / (n - 1))
 
     def predict(self, features: list[float]) -> float:
         """
@@ -110,12 +117,15 @@ class MLScorer:
         norm = self._normalize(features)
         pred = self._sigmoid(self._bias + sum(w * f for w, f in zip(self._weights, norm)))
 
-        # Gradient: d_loss/d_w = (pred - target) * feature
+        # Gradient: d_loss/d_w = (pred - target) * feature + L2 decay
         error = pred - target
         for i in range(self._n_features):
             grad = error * norm[i] + self._wd * self._weights[i]
             self._weights[i] -= self._lr * grad
+            # Weight clipping: previene overfitting estremo
+            self._weights[i] = max(-self._weight_clip, min(self._weight_clip, self._weights[i]))
         self._bias -= self._lr * error
+        self._bias = max(-self._weight_clip, min(self._weight_clip, self._bias))
 
         self._n_updates += 1
 

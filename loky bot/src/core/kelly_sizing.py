@@ -184,38 +184,42 @@ class KellySizer:
 
     def _compute_optimal_f(self) -> Optional[Decimal]:
         """
-        Optimal-f (Ralph Vince): trova la f che massimizza il TWR
-        (Terminal Wealth Relative) sulla sequenza di trade reali.
+        Optimal-f (Ralph Vince) con safeguard per stabilità.
 
-        Più robusto del Kelly classico per distribuzioni fat-tail (crypto).
-        Cerca la f in [0.01, 0.50] che massimizza il prodotto:
-          TWR = product(1 + f × return_i) per tutti i trade
-
-        Se qualsiasi (1 + f × return_i) < 0 → f troppo alto, skip.
+        Cerca f in [0.01, 0.30] (cap 30% per safety) che massimizza TWR.
+        Requisiti minimi: almeno 15 trade con almeno 5 vincenti.
+        TWR minimo: deve superare 1.05 (5% gain) per essere valido.
         """
         returns = list(self._returns)
-        if len(returns) < 10:
+        if len(returns) < 15:
+            return None
+        # Richiedi almeno 5 trade positivi per evitare bias da poche vincite
+        n_positive = sum(1 for r in returns if r > 0)
+        if n_positive < 5:
             return None
 
         best_f = Decimal('0.01')
-        best_twr = Decimal('0')
+        best_twr = Decimal('1')
 
-        # Cerca in step di 0.01 da 0.01 a 0.50
-        for f_int in range(1, 51):
+        # Cerca in step di 0.01 da 0.01 a 0.30 (max 30% per safety)
+        for f_int in range(1, 31):
             f = f_int / 100.0
             twr = 1.0
             valid = True
             for r in returns:
                 hpr = 1.0 + f * r
-                if hpr <= 0:
+                if hpr <= 0.01:  # quasi-ruin, non solo <= 0
                     valid = False
                     break
                 twr *= hpr
             if valid and twr > float(best_twr):
-                best_twr = Decimal(str(twr))
+                best_twr = Decimal(str(round(twr, 6)))
                 best_f = Decimal(str(f))
 
-        return best_f if best_twr > _ONE else None
+        # TWR minimo: deve mostrare almeno 5% di gain complessivo
+        if best_twr < Decimal('1.05'):
+            return None
+        return best_f
 
     # ------------------------------------------------------------------
     # Position size

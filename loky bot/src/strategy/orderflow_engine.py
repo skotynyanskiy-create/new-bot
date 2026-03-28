@@ -57,19 +57,22 @@ class OrderFlowEngine:
         self._delta_history.append(delta)
 
     def _calc_delta(self, candle: Candle) -> Decimal:
-        """Calcola il delta volume approssimato per una candle."""
+        """
+        Calcola il delta volume approssimato per una candle.
+
+        Formula unificata (indipendente dal colore della candela):
+          buy_ratio = (close - low) / (high - low)
+        Questo misura dove il close si posiziona nel range H-L:
+          close = high → buy_ratio = 1.0 (tutto buy pressure)
+          close = low  → buy_ratio = 0.0 (tutto sell pressure)
+          close = mid  → buy_ratio = 0.5 (equilibrio)
+        """
         hl_range = candle.high - candle.low
-        if hl_range <= _ZERO:
+        # Protezione doji: se range < 0.01% del prezzo, delta non significativo
+        if hl_range <= _ZERO or (candle.close > _ZERO and hl_range < candle.close * Decimal('0.0001')):
             return _ZERO
 
-        # Approssimazione: proporzione del volume attribuibile a buy vs sell
-        if candle.close >= candle.open:
-            # Candela verde: buy pressure dominante
-            buy_ratio = (candle.close - candle.low) / hl_range
-        else:
-            # Candela rossa: sell pressure dominante
-            buy_ratio = (candle.high - candle.close) / hl_range
-
+        buy_ratio = (candle.close - candle.low) / hl_range
         buy_vol = candle.volume * buy_ratio
         sell_vol = candle.volume * (Decimal('1') - buy_ratio)
         return buy_vol - sell_vol

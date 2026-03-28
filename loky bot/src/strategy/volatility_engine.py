@@ -49,13 +49,24 @@ class VolatilityRegimeEngine:
         self,
         indicators: IndicatorEngine,
         bb_width_history_len: int = 50,
+        lock_candles: int = 5,
     ) -> None:
         self._ind = indicators
         self._bb_width_history: deque[Decimal] = deque(maxlen=bb_width_history_len)
         self._atr_history: deque[Decimal] = deque(maxlen=100)
 
+        # Hysteresis state
+        self._current_regime = VolatilityRegime.NORMAL
+        self._regime_lock_remaining = 0
+        self._lock_candles = lock_candles
+        self._regime_changes: deque[int] = deque(maxlen=10)  # traccia cambi in 10 candle
+        self._candle_counter = 0
+
     def update(self) -> None:
-        """Aggiorna le rolling history con i valori correnti."""
+        """Aggiorna le rolling history e decrementa il lock hysteresis."""
+        self._candle_counter += 1
+        if self._regime_lock_remaining > 0:
+            self._regime_lock_remaining -= 1
         try:
             bb_upper = self._ind.bb_upper()
             bb_lower = self._ind.bb_lower()
@@ -105,19 +116,34 @@ class VolatilityRegimeEngine:
         bb_expanding = avg_recent > avg_older * Decimal('1.1')
         bb_contracting = avg_recent < avg_older * Decimal('0.9')
 
-        # COMPRESSION: bande strette + ATR basso → breakout imminente
+        # Calcola regime raw
         if bb_percentile < Decimal('0.20') and atr_percentile < Decimal('0.30'):
-            return VolatilityRegime.COMPRESSION
+            raw_regime = VolatilityRegime.COMPRESSION
+        elif bb_expanding and atr_percentile > Decimal('0.60'):
+            raw_regime = VolatilityRegime.EXPANSION
+        elif bb_contracting and atr_percentile > Decimal('0.40'):
+            raw_regime = VolatilityRegime.CONTRACTION
+        else:
+            raw_regime = VolatilityRegime.NORMAL
 
-        # EXPANSION: bande in crescita + ATR alto → trend in corso
-        if bb_expanding and atr_percentile > Decimal('0.60'):
-            return VolatilityRegime.EXPANSION
+        # Hysteresis: impedisce flip-flop
+        if self._regime_lock_remaining > 0:
+            return self._current_regime  # regime locked
 
-        # CONTRACTION: bande in calo dopo espansione → trend esaurito
-        if bb_contracting and atr_percentile > Decimal('0.40'):
-            return VolatilityRegime.CONTRACTION
+        if raw_regime != self._current_regime:
+            # Anti flip-flop: se >2 cambi in 10 candle, forza NORMAL
+            self._regime_changes.append(self._candle_counter)
+            recent_changes = sum(
+                1 for c in self._regime_changes
+                if self._candle_counter - c < 10
+            )
+            if recent_changes > 2:
+                raw_regime = VolatilityRegime.NORMAL
 
-        return VolatilityRegime.NORMAL
+            self._current_regime = raw_regime
+            self._regime_lock_remaining = self._lock_candles
+
+        return self._current_regime
 
     def score_modifier(self) -> Decimal:
         """

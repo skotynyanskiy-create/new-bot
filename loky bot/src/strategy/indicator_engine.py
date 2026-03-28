@@ -105,6 +105,28 @@ class IndicatorEngine:
             p: _TWO / (Decimal(p) + _ONE) for p in _RIBBON_PERIODS
         }
 
+        # --- MACD (12, 26, 9) ---
+        self._ema12: Optional[Decimal] = None
+        self._ema26: Optional[Decimal] = None
+        self._macd_signal: Optional[Decimal] = None
+        self._macd_val: Optional[Decimal] = None
+        self._macd_hist: Optional[Decimal] = None
+        self._k12 = _TWO / (Decimal('12') + _ONE)
+        self._k26 = _TWO / (Decimal('26') + _ONE)
+        self._k9  = _TWO / (Decimal('9') + _ONE)
+        self._hist_peaks: deque[Decimal] = deque(maxlen=5)
+        self._hist_valleys: deque[Decimal] = deque(maxlen=5)
+        self._price_at_hist_peak: deque[Decimal] = deque(maxlen=5)
+        self._price_at_hist_valley: deque[Decimal] = deque(maxlen=5)
+
+        # --- Stochastic RSI (14, 3, 3) ---
+        self._rsi_history: deque[Decimal] = deque(maxlen=14)
+        self._stoch_rsi_val: Optional[Decimal] = None
+        self._stoch_k_vals: deque[Decimal] = deque(maxlen=3)
+        self._stoch_k: Optional[Decimal] = None
+        self._stoch_d_vals: deque[Decimal] = deque(maxlen=3)
+        self._stoch_d: Optional[Decimal] = None
+
         # --- VWAP intraday (reset ogni nuovo giorno UTC) ---
         self._vwap_cum_pv:  Decimal = _ZERO   # Σ(typical_price × volume)
         self._vwap_cum_vol: Decimal = _ZERO   # Σ(volume)
@@ -135,6 +157,8 @@ class IndicatorEngine:
         self._update_adx(candle, prev)
         self._update_bb()
         self._update_ribbon(candle)
+        self._update_macd(candle)
+        self._update_stoch_rsi()
         self._update_vwap(candle)
 
     # ------------------------------------------------------------------
@@ -562,6 +586,140 @@ class IndicatorEngine:
             else:
                 k = self._ribbon_k[period]
                 self._ribbon_vals[period] = (price - self._ribbon_vals[period]) * k + self._ribbon_vals[period]
+
+    # ------------------------------------------------------------------
+    # MACD (12, 26, 9) + Divergence
+    # ------------------------------------------------------------------
+
+    def _update_macd(self, candle: Candle) -> None:
+        price = candle.close
+        # EMA12
+        if self._ema12 is None:
+            if self._n >= 12:
+                start = max(0, len(self._candles) - 12)
+                self._ema12 = sum(
+                    c.close for c in itertools.islice(self._candles, start, len(self._candles))
+                ) / Decimal('12')
+        else:
+            self._ema12 = (price - self._ema12) * self._k12 + self._ema12
+        # EMA26
+        if self._ema26 is None:
+            if self._n >= 26:
+                start = max(0, len(self._candles) - 26)
+                self._ema26 = sum(
+                    c.close for c in itertools.islice(self._candles, start, len(self._candles))
+                ) / Decimal('26')
+        else:
+            self._ema26 = (price - self._ema26) * self._k26 + self._ema26
+        # MACD line
+        if self._ema12 is not None and self._ema26 is not None:
+            self._macd_val = self._ema12 - self._ema26
+            # Signal line (9-EMA of MACD)
+            if self._macd_signal is None:
+                self._macd_signal = self._macd_val
+            else:
+                self._macd_signal = (self._macd_val - self._macd_signal) * self._k9 + self._macd_signal
+            # Histogram
+            prev_hist = self._macd_hist
+            self._macd_hist = self._macd_val - self._macd_signal
+            # Traccia peaks/valleys dell'histogram per divergence detection
+            if prev_hist is not None and self._macd_hist is not None:
+                if prev_hist > _ZERO and self._macd_hist <= _ZERO:
+                    self._hist_peaks.append(prev_hist)
+                    self._price_at_hist_peak.append(price)
+                elif prev_hist < _ZERO and self._macd_hist >= _ZERO:
+                    self._hist_valleys.append(prev_hist)
+                    self._price_at_hist_valley.append(price)
+
+    def macd(self) -> Decimal:
+        if self._macd_val is None:
+            raise ValueError("MACD non disponibile")
+        return self._macd_val
+
+    def macd_signal(self) -> Decimal:
+        if self._macd_signal is None:
+            raise ValueError("MACD signal non disponibile")
+        return self._macd_signal
+
+    def macd_histogram(self) -> Decimal:
+        if self._macd_hist is None:
+            raise ValueError("MACD histogram non disponibile")
+        return self._macd_hist
+
+    def macd_bearish_divergence(self) -> bool:
+        """Price higher high + histogram lower high = reversal bearish."""
+        if len(self._hist_peaks) < 2 or len(self._price_at_hist_peak) < 2:
+            return False
+        return (
+            self._price_at_hist_peak[-1] > self._price_at_hist_peak[-2]
+            and self._hist_peaks[-1] < self._hist_peaks[-2]
+        )
+
+    def macd_bullish_divergence(self) -> bool:
+        """Price lower low + histogram higher low = reversal bullish."""
+        if len(self._hist_valleys) < 2 or len(self._price_at_hist_valley) < 2:
+            return False
+        return (
+            self._price_at_hist_valley[-1] < self._price_at_hist_valley[-2]
+            and self._hist_valleys[-1] > self._hist_valleys[-2]
+        )
+
+    # ------------------------------------------------------------------
+    # Stochastic RSI (14, 3, 3)
+    # ------------------------------------------------------------------
+
+    def _update_stoch_rsi(self) -> None:
+        try:
+            current_rsi = self.rsi()
+        except ValueError:
+            return
+        self._rsi_history.append(current_rsi)
+        if len(self._rsi_history) < 14:
+            return
+        rsi_min = min(self._rsi_history)
+        rsi_max = max(self._rsi_history)
+        rsi_range = rsi_max - rsi_min
+        if rsi_range <= _ZERO:
+            self._stoch_rsi_val = Decimal('50')
+        else:
+            self._stoch_rsi_val = ((current_rsi - rsi_min) / rsi_range) * _HUNDRED
+        # K% = 3-SMA of StochRSI
+        self._stoch_k_vals.append(self._stoch_rsi_val)
+        if len(self._stoch_k_vals) >= 3:
+            self._stoch_k = sum(self._stoch_k_vals) / Decimal(len(self._stoch_k_vals))
+            # D% = 3-SMA of K%
+            self._stoch_d_vals.append(self._stoch_k)
+            if len(self._stoch_d_vals) >= 3:
+                self._stoch_d = sum(self._stoch_d_vals) / Decimal(len(self._stoch_d_vals))
+
+    def stoch_rsi(self) -> Decimal:
+        if self._stoch_rsi_val is None:
+            raise ValueError("StochRSI non disponibile")
+        return self._stoch_rsi_val
+
+    def stoch_k(self) -> Decimal:
+        if self._stoch_k is None:
+            raise ValueError("StochRSI K% non disponibile")
+        return self._stoch_k
+
+    def stoch_d(self) -> Decimal:
+        if self._stoch_d is None:
+            raise ValueError("StochRSI D% non disponibile")
+        return self._stoch_d
+
+    def stoch_oversold_bounce(self) -> bool:
+        """True se K% rimbalza da zona ipervenduta (<20) verso l'alto."""
+        if len(self._stoch_k_vals) < 3:
+            return False
+        vals = list(self._stoch_k_vals)
+        return vals[-2] < Decimal('20') and vals[-1] > vals[-2]
+
+    def stoch_overbought_drop(self) -> bool:
+        """True se K% scende da zona ipercomprata (>80) verso il basso."""
+        if len(self._stoch_k_vals) < 3:
+            return False
+        vals = list(self._stoch_k_vals)
+        return vals[-2] > Decimal('80') and vals[-1] < vals[-2]
 
     # ------------------------------------------------------------------
     # Metodi privati di calcolo — VWAP intraday

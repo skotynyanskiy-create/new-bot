@@ -18,7 +18,7 @@ import time
 from decimal import Decimal
 from typing import Optional
 
-from src.bot import LokyBot, _start_prometheus_server
+from src.bot import BotState, LokyBot, _start_prometheus_server
 from src.config import config
 from src.core.account_risk import AccountRiskManager
 from src.core.portfolio_risk import PortfolioRiskManager
@@ -49,6 +49,11 @@ class FuturesOrchestrator:
         self._notify_tasks: set[asyncio.Task] = set()
         self._start_time = time.time()
         self._last_candle_time = time.time()   # per dead-man switch
+
+        # BTC crash protection
+        self._crisis_mode = False
+        self._crisis_until: float = 0.0  # timestamp fino a cui resta attivo
+        self._btc_prices: deque[Decimal] = deque(maxlen=8)  # ultimi 8 close BTC (2h su 15m)
 
         # Capital per-symbol
         capital_per_symbol = capital / Decimal(len(symbols))
@@ -140,6 +145,23 @@ class FuturesOrchestrator:
 
     async def _route_candle(self, symbol: str, candle: Candle) -> None:
         self._last_candle_time = time.time()   # aggiorna dead-man switch
+
+        # BTC crash protection: traccia prezzo BTC e detecta crash
+        if symbol == "BTCUSDT" and candle.timeframe == config.primary_timeframe:
+            self._btc_prices.append(candle.close)
+            await self._check_btc_crash(candle)
+
+        # Se in crisis mode, blocca entry su altcoin
+        if self._crisis_mode and time.time() < self._crisis_until:
+            if symbol != "BTCUSDT":
+                bot = self._bots.get(symbol)
+                if bot and bot._state == BotState.FLAT:
+                    return  # skip candle per altcoin in crisis mode
+        elif self._crisis_mode and time.time() >= self._crisis_until:
+            self._crisis_mode = False
+            logger.info("BTC crash protection: crisis mode disattivato, trading riprende.")
+            self._fire_and_forget(self._notifier.info("🟢 Crisis mode terminato. Trading riprende."))
+
         bot = self._bots.get(symbol)
         if bot:
             # Lock per-symbol: serializza elaborazione candle per evitare
@@ -171,6 +193,29 @@ class FuturesOrchestrator:
                 if prev > 0:
                     log_ret = _math.log(float(candle.close / prev))
                     self._portfolio_risk.record_return(symbol, log_ret)
+
+    async def _check_btc_crash(self, candle: Candle) -> None:
+        """Detecta crash BTC (>3% drop in 4 candle = 1h su 15m) e attiva crisis mode."""
+        if self._crisis_mode:
+            return
+        if len(self._btc_prices) < 4:
+            return
+        price_4_candles_ago = self._btc_prices[-4]
+        if price_4_candles_ago <= 0:
+            return
+        drop_pct = (price_4_candles_ago - candle.close) / price_4_candles_ago
+        if drop_pct > Decimal('0.03'):  # >3% drop in 1h
+            self._crisis_mode = True
+            self._crisis_until = time.time() + 1800  # 30 minuti
+            logger.warning(
+                "BTC CRASH PROTECTION: BTC -%.1f%% in 1h. Crisis mode per 30min.",
+                float(drop_pct * 100),
+            )
+            self._fire_and_forget(self._notifier.info(
+                f"🚨 <b>BTC CRASH PROTECTION</b>\n"
+                f"BTC -{float(drop_pct * 100):.1f}% in 1h.\n"
+                f"Altcoin entry bloccate per 30 minuti."
+            ))
 
     async def _route_order_update(self, order) -> None:
         bot = self._bots.get(order.symbol)

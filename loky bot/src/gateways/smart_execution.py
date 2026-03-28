@@ -119,12 +119,13 @@ class AggressiveChaser:
     def __init__(
         self,
         max_chase_attempts: int = 3,
-        chase_interval_s: float = 2.0,
+        chase_interval_s: float = 0.5,
         tick_size: Decimal = Decimal('0.1'),
     ) -> None:
         self._max_attempts = max_chase_attempts
         self._interval = chase_interval_s
         self._tick_size = tick_size
+        self._high_vol_skip = True  # skip chaser in alta volatilità
 
     async def execute(
         self,
@@ -133,14 +134,21 @@ class AggressiveChaser:
         side: Side,
         size: Decimal,
         initial_price: Decimal,
+        atr_percentile: float = 0.5,
     ) -> Optional[Order]:
         """
         Tenta di fillare con limit order aggressivo.
         Se fallisce dopo max_attempts, cade su market order.
+        In alta volatilità (ATR pctile > 80%), skip diretto a market.
 
         Returns:
             Order fillato o None se fallito anche il market fallback
         """
+        # Skip chaser in mercati veloci: il risparmio di 2 bps non vale il rischio
+        if self._high_vol_skip and atr_percentile > 0.80:
+            logger.info("Chase skip: alta volatilità (ATR pctile %.0f%%) → market diretto", atr_percentile * 100)
+            return await gateway.submit_market_order(symbol, side, size)
+
         price = initial_price
         order_id = None
 

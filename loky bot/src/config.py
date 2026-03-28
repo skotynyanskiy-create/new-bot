@@ -73,7 +73,7 @@ class StrategySettings(BaseModel):
     scale_in_profit_atr_mult: Decimal = Decimal('0.5')  # profitto minimo (in ATR) per attivare scale-in
 
     # --- Regime avanzato ---
-    choppy_market_pause: bool = True   # ADX < 15 = mercato choppy → nessun trade
+    # choppy_market_pause rimosso v6.5 — il CHOPPY block è gestito da is_choppy_market() nell'aggregator
 
     @field_validator('sl_atr_mult')
     @classmethod

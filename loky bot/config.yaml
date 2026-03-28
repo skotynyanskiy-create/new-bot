@@ -69,7 +69,7 @@ strategy:
   circuit_breaker_candles: 15    # candle di pausa dopo attivazione circuit breaker
 
   # --- Regime avanzato ---
-  choppy_market_pause: true      # ADX < 15 = mercato choppy → nessun trade
+  # choppy_market_pause rimosso — gestito da is_choppy_market() nell'aggregator
 
 # === RISK MANAGEMENT ===
 risk_per_trade_pct: 0.015        # 1.5% del capitale per trade (Kelly override se attivo)

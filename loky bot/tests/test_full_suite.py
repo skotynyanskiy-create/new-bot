@@ -317,13 +317,13 @@ class TestOrderIdUniqueness:
         assert str(parsed) == order_id
 
 
-# (TestFairValueEngine, TestQuoteEngineExtended, TestRiskEngineExtended
-#  rimossi — moduli legacy cancellati in v6.0)
-class TestFairValueEngine:
-    def setup_method(self):
-        self.engine = FairValueEngine()
+# (Legacy test classes TestFairValueEngine, TestQuoteEngineExtended,
+#  TestRiskEngineExtended removed — modules deleted in v6.0)
 
-    def test_vwap_basic(self):
+
+# ================================================================== #
+#  SimulatorGateway                                                    #
+# ================================================================== #
         book = {
             'bids': [(100, 10), (99, 20)],
             'asks': [(101, 10), (102, 20)],
@@ -382,10 +382,10 @@ class TestFairValueEngine:
         assert fv_low  >= Decimal('0.01')
 
 
-# ================================================================== #
-#  QuoteEngine                                                         #
-# ================================================================== #
-class TestQuoteEngineExtended:
+# (TestQuoteEngineExtended + TestRiskEngineExtended removed)
+
+
+class _DEAD_MARKER_START:  # marker for removal
     def setup_method(self):
         self.engine = QuoteEngine(
             skew_factor=Decimal('1.0'),

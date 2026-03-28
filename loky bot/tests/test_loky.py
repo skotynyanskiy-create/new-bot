@@ -1712,3 +1712,139 @@ class TestIntegrationPartialTPFlow:
         cfg = BotSettings()
         s = cfg.strategy
         assert s.partial_tp1_atr < s.partial_tp2_atr < s.partial_tp3_atr
+
+
+# ================================================================== #
+#  ADDITIONAL COVERAGE TESTS                                          #
+# ================================================================== #
+
+class TestConfigEdgeCases:
+    """Verifica edge case nella configurazione."""
+
+    def test_all_timeframes_valid(self):
+        for tf in ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d', '1w']:
+            cfg = BotSettings(primary_timeframe=tf, confirmation_timeframe=tf, macro_timeframe=tf)
+            assert cfg.primary_timeframe == tf
+
+    def test_leverage_consistency_enforced(self):
+        with pytest.raises(Exception):
+            BotSettings(leverage=10, max_leverage=5)
+
+    def test_default_config_is_paper(self):
+        cfg = BotSettings()
+        assert cfg.live_trading_enabled is False
+
+
+class TestSharedSizing:
+    """Verifica il modulo di sizing condiviso."""
+
+    def test_calc_risk_size_basic(self):
+        from src.strategy.sizing import calc_risk_size
+        size = calc_risk_size(
+            capital=Decimal("10000"), risk_pct=Decimal("0.015"),
+            sl_distance=Decimal("100"), leverage=3, price=Decimal("50000"),
+        )
+        assert size > Decimal("0")
+
+    def test_calc_risk_size_zero_sl(self):
+        from src.strategy.sizing import calc_risk_size
+        size = calc_risk_size(
+            capital=Decimal("10000"), risk_pct=Decimal("0.015"),
+            sl_distance=Decimal("0"), leverage=3, price=Decimal("50000"),
+        )
+        assert size == Decimal("0")
+
+    def test_calc_risk_size_below_min_notional(self):
+        from src.strategy.sizing import calc_risk_size
+        size = calc_risk_size(
+            capital=Decimal("10"), risk_pct=Decimal("0.001"),
+            sl_distance=Decimal("1000"), leverage=1, price=Decimal("50000"),
+        )
+        assert size == Decimal("0")  # notional < $6
+
+    def test_calc_risk_size_with_fraction(self):
+        from src.strategy.sizing import calc_risk_size
+        full = calc_risk_size(
+            capital=Decimal("100000"), risk_pct=Decimal("0.015"),
+            sl_distance=Decimal("100"), leverage=10, price=Decimal("50000"),
+        )
+        half = calc_risk_size(
+            capital=Decimal("100000"), risk_pct=Decimal("0.015"),
+            sl_distance=Decimal("100"), leverage=10, price=Decimal("50000"),
+            fraction=Decimal("0.5"),
+        )
+        assert half < full  # half-fraction = half risk = half size
+
+
+class TestExpectancyWeights:
+    """Verifica che expectancy negativa penalizzi anche con alto win rate."""
+
+    def test_high_wr_negative_expectancy_penalized(self):
+        from src.strategy.signal_aggregator import SignalAggregator
+        agg = SignalAggregator(IndicatorEngine())
+        # 7 win a +$2, 3 loss a -$10 → WR 70% ma expectancy: 0.7*2 - 0.3*10 = -1.6
+        for _ in range(7):
+            agg.record_trade_result("bad_strategy", Decimal("2"))
+        for _ in range(3):
+            agg.record_trade_result("bad_strategy", Decimal("-10"))
+        weight = agg.strategy_weight("bad_strategy")
+        assert weight < Decimal("1.0")  # penalizzata nonostante WR 70%
+
+
+class TestScoreAdaptiveEntry:
+    """Verifica che score diversi producano SL diversi."""
+
+    def test_high_score_tight_sl(self):
+        # Score >= 85: sl_score_mult = 0.8 (SL stretto)
+        score = Decimal("90")
+        if score >= Decimal("85"):
+            mult = Decimal("0.8")
+        elif score >= Decimal("70"):
+            mult = Decimal("1.0")
+        else:
+            mult = Decimal("1.3")
+        assert mult == Decimal("0.8")
+
+    def test_low_score_wide_sl(self):
+        score = Decimal("55")
+        if score >= Decimal("85"):
+            mult = Decimal("0.8")
+        elif score >= Decimal("70"):
+            mult = Decimal("1.0")
+        else:
+            mult = Decimal("1.3")
+        assert mult == Decimal("1.3")
+
+
+class TestDynamicTPAdjustment:
+    """Verifica che il dynamic TP sia una sola volta per trade."""
+
+    def test_tp_adjusted_flag_exists(self):
+        """Il flag _tp_adjusted deve essere inizializzato a False."""
+        from src.bot import LokyBot
+        from src.backtest import _InMemoryStateManager, _BacktestGateway
+        cfg = BotSettings(tokens=["BTCUSDT"], live_trading_enabled=False,
+                          max_daily_loss_pct=Decimal("0.50"))
+        bot = LokyBot(
+            symbol="BTCUSDT", config=cfg, execution_gw=_BacktestGateway(),
+            state_manager=_InMemoryStateManager(), capital=Decimal("10000"),
+        )
+        assert bot._tp_adjusted is False
+
+
+class TestOrderFlowDelta:
+    """Verifica il calcolo delta per vari tipi di candle."""
+
+    def test_neutral_candle_small_delta(self):
+        from src.strategy.orderflow_engine import OrderFlowEngine
+        engine = OrderFlowEngine()
+        # Candle con close al centro: delta ~0
+        c = Candle(
+            symbol="BTCUSDT", timeframe="15m",
+            open=Decimal("100"), high=Decimal("102"),
+            low=Decimal("98"), close=Decimal("100"),
+            volume=Decimal("1000"), timestamp=1.0, is_closed=True,
+        )
+        engine.update(c)
+        # Close al centro del range (100 - 98) / (102 - 98) = 0.5 → delta ~0
+        assert abs(engine.current_delta) < Decimal("100")

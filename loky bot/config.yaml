@@ -75,7 +75,7 @@ strategy:
 risk_per_trade_pct: 0.015        # 1.5% del capitale per trade (Kelly override se attivo)
 max_concurrent_positions: 2
 leverage: 3                      # Leva base (override dinamico se dynamic_leverage_enabled)
-max_daily_loss: -30.0            # Stop loss giornaliero in USDT
+max_daily_loss_pct: 0.05         # 5% del capitale = daily stop (scala col capitale)
 max_position_per_asset: 0.05
 
 # === PORTFOLIO & LEVA DINAMICA ===

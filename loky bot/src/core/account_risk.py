@@ -25,7 +25,7 @@ class AccountRiskManager:
     Singleton condiviso tra tutti i bot dello stesso orchestratore.
 
     Args:
-        max_daily_loss_account   — perdita USDT giornaliera massima sull'intero conto
+        max_daily_loss_pct       — perdita giornaliera massima come % del capitale (es. 0.05 = 5%)
         max_concurrent_positions — numero massimo di posizioni aperte in contemporanea
         max_peak_drawdown_pct    — drawdown massimo dal picco equity (es. 0.15 = 15%)
         initial_capital          — capitale iniziale per calcolo drawdown (USDT)
@@ -33,12 +33,13 @@ class AccountRiskManager:
 
     def __init__(
         self,
-        max_daily_loss_account: Decimal = Decimal("-50"),
+        max_daily_loss_pct: Decimal = Decimal("0.05"),
         max_concurrent_positions: int = 2,
         max_peak_drawdown_pct: Decimal = Decimal("0.15"),
         initial_capital: Decimal = Decimal("500"),
     ) -> None:
-        self._max_daily_loss    = max_daily_loss_account
+        self._max_daily_loss_pct = max_daily_loss_pct
+        self._max_daily_loss    = -(initial_capital * max_daily_loss_pct)  # calcolato dal capitale
         self._max_concurrent    = max_concurrent_positions
         self._max_dd_pct        = max_peak_drawdown_pct
         self._realized_pnl_day: Decimal = _ZERO

@@ -194,6 +194,7 @@ class LokyBot:
         # --- Partial TP ---
         self._tp_levels: list[TPLevel] = []
         self._accumulated_trade_pnl: Decimal = _ZERO  # PnL totale del trade (somma dei parziali)
+        self._partial_locked_pnl: Decimal = _ZERO     # PnL locked da partial exits (per Kelly)
 
         # --- Pyramid (scaling-in) ---
         self._scale_in_count: int = 0    # numero di add-on effettuati (max 1)
@@ -632,7 +633,7 @@ class LokyBot:
     # ------------------------------------------------------------------
 
     def _is_daily_stop_active(self) -> bool:
-        if self.realized_pnl <= self._cfg.max_daily_loss:
+        if self.realized_pnl <= -(self._capital * self._cfg.max_daily_loss_pct):
             if not self._daily_stop_triggered:
                 logger.warning(
                     "%s Daily loss limit raggiunto (%.2f USDT). Trading sospeso.",
@@ -798,6 +799,7 @@ class LokyBot:
         self._entry_time         = time.time()
         self._state              = BotState.POSITION_OPEN
         self._accumulated_trade_pnl = _ZERO
+        self._partial_locked_pnl   = _ZERO
         self._kelly_risk_size    = size        # snapshot pre-scale-in per Kelly
         self._kelly_risk_entry   = fill_price  # entry originale per Kelly
 
@@ -970,6 +972,7 @@ class LokyBot:
         self.total_trades  += 1
         self._position_size -= close_size
         self._accumulated_trade_pnl += pnl
+        self._partial_locked_pnl += pnl  # traccia profitto locked per Kelly
         self._state = BotState.PARTIAL_EXIT
 
         logger.info(
@@ -1054,12 +1057,16 @@ class LokyBot:
         # invece di ricalcolare su position_size_orig × ultimo exit_price (errato con partial TP)
         total_pnl_trade = self._accumulated_trade_pnl
 
-        # Aggiorna Kelly con il risultato del trade completo
-        # Usa entry/size originali pre-scale-in per non corrompere il risk_amount
+        # Aggiorna Kelly con il risultato del trade completo.
+        # risk_amount netto: rischio iniziale meno profitto già locked da partial exits.
+        # Dopo TP1 lo SL va a breakeven → il rischio residuo è effettivamente ridotto.
+        # Questo evita di sovrastimare il win rate nel Kelly Criterion.
         kelly_entry = self._kelly_risk_entry if self._kelly_risk_entry > _ZERO else self._entry_price
         kelly_size  = self._kelly_risk_size  if self._kelly_risk_size  > _ZERO else self._position_size_orig
         sl_distance = abs(kelly_entry - self._sl_price_orig)
-        risk_amount = sl_distance * kelly_size
+        gross_risk  = sl_distance * kelly_size
+        # Rischio netto = max(rischio lordo - profitto locked, piccolo floor per evitare div/0)
+        risk_amount = max(gross_risk - self._partial_locked_pnl, gross_risk * Decimal('0.1'))
         self._kelly.update(total_pnl_trade, risk_amount)
 
         # PnL attribution per strategy engine (per analytics/performance review)

@@ -89,12 +89,12 @@ class MeanReversionEngine:
         vol_ratio = candle.volume / vol_ma if vol_ma > _ZERO else Decimal('1')
         volume_ok = True  # Mean reversion accetta qualsiasi volume in ranging
         vol_score_bonus = _ZERO
-        if vol_ratio > Decimal('2.0'):
+        if vol_ratio > Decimal('3.0'):
+            vol_score_bonus = Decimal('-5')   # Volume eccessivo = possibile trend forte, cautela
+        elif vol_ratio > Decimal('2.0'):
             vol_score_bonus = Decimal('8')    # Spike volume = capitolazione → segnale forte
         elif vol_ratio > Decimal('1.5'):
             vol_score_bonus = Decimal('4')
-        elif vol_ratio > Decimal('3.0'):
-            vol_score_bonus = Decimal('-5')   # Volume eccessivo = possibile trend forte, cautela
 
         # BB width check: evita entry quando le bande sono troppo strette (squeeze imminente)
         bb_width = _ZERO

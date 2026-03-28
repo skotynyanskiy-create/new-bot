@@ -134,11 +134,11 @@ class BreakoutEngine:
                 )
 
         # ---- SHORT -------------------------------------------------------
-        # RSI SHORT: simmetrico al LONG.
-        # SHORT valido se RSI è ipervenduto (< rsi_min) — momentum ribassista
-        #             O ipercomprato (> rsi_max) — mean-reversion short da eccesso
-        # Questo esclude la zona neutrale [rsi_min, rsi_max] dove il trend non è chiaro.
-        rsi_short_ok = rsi_val < self._cfg.rsi_min or rsi_val > self._cfg.rsi_max
+        # RSI SHORT: breakout ribassista richiede momentum ribassista (RSI basso).
+        # Specularmente al LONG (rsi_min <= rsi <= rsi_max), lo SHORT richiede
+        # RSI nella banda bassa: (100 - rsi_max) <= RSI <= (100 - rsi_min).
+        # Default: 28 <= RSI <= 55 per SHORT (momentum ribassista, non ipervenduto estremo).
+        rsi_short_ok = (Decimal('100') - self._cfg.rsi_max) <= rsi_val <= (Decimal('100') - self._cfg.rsi_min)
         is_bearish = candle.close < candle.open
         if (
             candle.close < ll

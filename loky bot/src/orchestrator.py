@@ -70,7 +70,7 @@ class FuturesOrchestrator:
 
         # Risk manager account-level (condiviso tra tutti i bot)
         self._account_risk = AccountRiskManager(
-            max_daily_loss_account=config.max_daily_loss * Decimal(len(self.symbols)),
+            max_daily_loss_pct=config.max_daily_loss_pct,
             max_concurrent_positions=config.max_concurrent_positions,
             max_peak_drawdown_pct=getattr(config, 'max_peak_drawdown_pct', Decimal('0.15')),
             initial_capital=capital,

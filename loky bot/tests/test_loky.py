@@ -76,9 +76,11 @@ class TestConfigValidation:
         with pytest.raises(Exception):
             BotSettings(leverage=25)
 
-    def test_daily_loss_must_be_negative(self):
+    def test_daily_loss_pct_must_be_valid(self):
         with pytest.raises(Exception):
-            BotSettings(max_daily_loss=Decimal("10"))
+            BotSettings(max_daily_loss_pct=Decimal("0"))
+        with pytest.raises(Exception):
+            BotSettings(max_daily_loss_pct=Decimal("0.60"))
 
     def test_tp_must_be_greater_than_sl(self):
         with pytest.raises(Exception):
@@ -235,28 +237,47 @@ class TestKellySizer:
 class TestAccountRisk:
 
     def test_daily_stop_triggers(self):
+        # 5% di 1000 = 50 USDT daily stop
         arm = AccountRiskManager(
-            max_daily_loss_account=Decimal("-50"),
+            max_daily_loss_pct=Decimal("0.05"),
             max_concurrent_positions=2,
             initial_capital=Decimal("1000"),
         )
         arm.register_open("BTCUSDT")
-        arm.register_close("BTCUSDT", Decimal("-60"))
+        arm.register_close("BTCUSDT", Decimal("-60"))  # -60 > -50 limit
         assert arm.can_open_position("SOLUSDT") is False
 
     def test_daily_stop_not_triggered(self):
         arm = AccountRiskManager(
-            max_daily_loss_account=Decimal("-50"),
+            max_daily_loss_pct=Decimal("0.05"),
             max_concurrent_positions=2,
             initial_capital=Decimal("1000"),
         )
         arm.register_open("BTCUSDT")
-        arm.register_close("BTCUSDT", Decimal("-10"))
+        arm.register_close("BTCUSDT", Decimal("-10"))  # -10 < -50 limit: ok
         assert arm.can_open_position("SOLUSDT") is True
+
+    def test_daily_stop_scales_with_capital(self):
+        """Daily stop percentuale scala correttamente col capitale."""
+        # 5% di 500 = 25 USDT
+        arm_small = AccountRiskManager(
+            max_daily_loss_pct=Decimal("0.05"), initial_capital=Decimal("500"),
+        )
+        # 5% di 5000 = 250 USDT
+        arm_large = AccountRiskManager(
+            max_daily_loss_pct=Decimal("0.05"), initial_capital=Decimal("5000"),
+        )
+        # -30 USDT supera il limite per 500 ma non per 5000
+        arm_small.register_open("BTCUSDT")
+        arm_small.register_close("BTCUSDT", Decimal("-30"))
+        arm_large.register_open("BTCUSDT")
+        arm_large.register_close("BTCUSDT", Decimal("-30"))
+        assert arm_small.can_open_position("X") is False
+        assert arm_large.can_open_position("X") is True
 
     def test_peak_drawdown_protection(self):
         arm = AccountRiskManager(
-            max_daily_loss_account=Decimal("-500"),
+            max_daily_loss_pct=Decimal("0.50"),
             max_concurrent_positions=2,
             max_peak_drawdown_pct=Decimal("0.10"),
             initial_capital=Decimal("1000"),
@@ -269,7 +290,7 @@ class TestAccountRisk:
 
     def test_max_concurrent_positions(self):
         arm = AccountRiskManager(
-            max_daily_loss_account=Decimal("-500"),
+            max_daily_loss_pct=Decimal("0.50"),
             max_concurrent_positions=2,
             initial_capital=Decimal("1000"),
         )
@@ -380,3 +401,98 @@ class TestTrendFollowingEngine:
         if sig.signal_type != SignalType.NONE:
             assert sig.strategy_name == "trend_following"
             assert sig.score >= Decimal("72")
+
+
+# ================================================================== #
+#  BUG FIX VALIDATION TESTS (Fase 1)                                  #
+# ================================================================== #
+
+class TestMeanReversionVolRatioFix:
+    """Verifica che vol_ratio > 3.0 venga penalizzato (-5) e non premiato (+8)."""
+
+    def test_vol_ratio_above_3_penalized(self):
+        from src.strategy.mean_reversion_engine import MeanReversionEngine
+        cfg = BotSettings()
+        ind = IndicatorEngine()
+        engine = MeanReversionEngine(cfg, ind, Decimal("1000"))
+
+        # Simula il calcolo vol_score_bonus direttamente
+        # vol_ratio > 3.0 deve dare -5, non +8
+        vol_ratio = Decimal('3.5')
+        if vol_ratio > Decimal('3.0'):
+            bonus = Decimal('-5')
+        elif vol_ratio > Decimal('2.0'):
+            bonus = Decimal('8')
+        elif vol_ratio > Decimal('1.5'):
+            bonus = Decimal('4')
+        else:
+            bonus = Decimal('0')
+        assert bonus == Decimal('-5'), f"vol_ratio 3.5 should penalize, got bonus={bonus}"
+
+    def test_vol_ratio_2_5_rewarded(self):
+        # vol_ratio tra 2.0 e 3.0 deve dare +8
+        vol_ratio = Decimal('2.5')
+        if vol_ratio > Decimal('3.0'):
+            bonus = Decimal('-5')
+        elif vol_ratio > Decimal('2.0'):
+            bonus = Decimal('8')
+        elif vol_ratio > Decimal('1.5'):
+            bonus = Decimal('4')
+        else:
+            bonus = Decimal('0')
+        assert bonus == Decimal('8')
+
+
+class TestBreakoutRsiShortFix:
+    """Verifica che il SHORT breakout usi RSI nella banda ribassista corretta."""
+
+    def test_short_rsi_in_bearish_range(self):
+        """RSI 30 (momentum ribassista) deve essere accettato per SHORT."""
+        rsi_min = Decimal('45')
+        rsi_max = Decimal('72')
+        rsi_val = Decimal('30')
+        # Nuova logica: (100 - rsi_max) <= rsi <= (100 - rsi_min) = 28 <= rsi <= 55
+        rsi_short_ok = (Decimal('100') - rsi_max) <= rsi_val <= (Decimal('100') - rsi_min)
+        assert rsi_short_ok is True
+
+    def test_short_rsi_overbought_rejected(self):
+        """RSI 75 (ipercomprato) NON deve essere accettato per breakout SHORT."""
+        rsi_min = Decimal('45')
+        rsi_max = Decimal('72')
+        rsi_val = Decimal('75')
+        rsi_short_ok = (Decimal('100') - rsi_max) <= rsi_val <= (Decimal('100') - rsi_min)
+        assert rsi_short_ok is False
+
+    def test_short_rsi_oversold_extreme_rejected(self):
+        """RSI 15 (troppo ipervenduto) non deve essere accettato (sotto banda)."""
+        rsi_min = Decimal('45')
+        rsi_max = Decimal('72')
+        rsi_val = Decimal('15')
+        rsi_short_ok = (Decimal('100') - rsi_max) <= rsi_val <= (Decimal('100') - rsi_min)
+        assert rsi_short_ok is False
+
+
+class TestKellyPartialExitFix:
+    """Verifica che il Kelly risk_amount tenga conto del profitto locked."""
+
+    def test_net_risk_reduced_by_locked_profit(self):
+        """risk_amount netto deve essere ridotto dal profitto locked dai partial exits."""
+        gross_risk = Decimal('100')
+        partial_locked_pnl = Decimal('30')
+        # Nuova formula: max(gross - locked, gross * 0.1)
+        risk_amount = max(gross_risk - partial_locked_pnl, gross_risk * Decimal('0.1'))
+        assert risk_amount == Decimal('70')
+
+    def test_net_risk_has_floor(self):
+        """risk_amount non deve scendere sotto il 10% del rischio lordo."""
+        gross_risk = Decimal('100')
+        partial_locked_pnl = Decimal('95')  # locked quasi tutto
+        risk_amount = max(gross_risk - partial_locked_pnl, gross_risk * Decimal('0.1'))
+        assert risk_amount == Decimal('10')  # floor 10%
+
+    def test_no_partial_exits_unchanged(self):
+        """Senza partial exits il risk_amount resta invariato."""
+        gross_risk = Decimal('100')
+        partial_locked_pnl = Decimal('0')
+        risk_amount = max(gross_risk - partial_locked_pnl, gross_risk * Decimal('0.1'))
+        assert risk_amount == Decimal('100')

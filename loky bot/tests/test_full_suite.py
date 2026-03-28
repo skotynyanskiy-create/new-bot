@@ -17,9 +17,9 @@ from src.core.risk_engine import RiskEngine, SystemState, KillSwitchException
 from src.core.fair_value import FairValueEngine
 from src.state.order_manager import OrderManager
 from src.gateways.simulator import SimulatorGateway
-from src.backtest import BacktestEngine
+from src.backtest import CandleBacktestEngine as BacktestEngine
 from src.config import BotSettings
-from src.bot import EventDrivenBot
+from src.bot import LokyBot as EventDrivenBot
 
 
 # ================================================================== #
@@ -35,7 +35,7 @@ def make_cfg(**overrides) -> BotSettings:
         fee_maker=Decimal('0.001'),
         fee_taker=Decimal('0.001'),
         rate_limit_rps=100,
-        max_daily_loss=Decimal('-9999'),
+        max_daily_loss_pct=Decimal('0.50'),
         max_position_per_asset=Decimal('1.0'),
         live_trading_enabled=False,
     )

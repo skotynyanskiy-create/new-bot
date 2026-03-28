@@ -95,15 +95,30 @@ class FundingRateEngine:
         entry = candle.close
         sl_distance = Decimal('0.5') * atr_val
 
+        # TP a 1.0×ATR, SL a 0.8×ATR → R:R 1.25:1 (ragionevole per funding harvest).
+        # Il profitto principale viene dal funding stesso, il TP è un bonus.
+        # Score proporzionale al funding rate: rate più alto = segnale più forte.
+        tp_distance = Decimal('1.0') * atr_val
+        sl_distance = Decimal('0.8') * atr_val
+
+        # Score dinamico: funding rate più alto → più affidabile
+        abs_rate = abs(funding_rate)
+        if abs_rate > threshold * 3:
+            score = Decimal('85')   # funding estremo
+        elif abs_rate > threshold * 2:
+            score = Decimal('80')
+        else:
+            score = Decimal('72')   # appena sopra threshold
+
         # funding positivo → SHORT (long pagano short)
         if funding_rate > threshold:
-            tp   = entry - Decimal('0.3') * atr_val   # obiettivo conservativo
+            tp   = entry - tp_distance
             sl   = entry + sl_distance
             size = self._calc_size(sl_distance, entry, fraction=Decimal('0.5'))
             if size > _ZERO:
                 logger.info(
-                    "SHORT funding-harvest %s | rate=%.4f%% tp=%.4f sl=%.4f",
-                    candle.symbol, float(funding_rate * 100), tp, sl,
+                    "SHORT funding-harvest %s | rate=%.4f%% tp=%.4f sl=%.4f score=%.0f",
+                    candle.symbol, float(funding_rate * 100), tp, sl, score,
                 )
                 return Signal(
                     symbol=candle.symbol,
@@ -114,19 +129,19 @@ class FundingRateEngine:
                     size=size,
                     atr=atr_val,
                     timestamp=time.time(),
-                    score=Decimal('80'),
+                    score=score,
                     strategy_name="funding_rate",
                 )
 
         # funding negativo → LONG (short pagano long)
         if funding_rate < -threshold:
-            tp   = entry + Decimal('0.3') * atr_val
+            tp   = entry + tp_distance
             sl   = entry - sl_distance
             size = self._calc_size(sl_distance, entry, fraction=Decimal('0.5'))
             if size > _ZERO:
                 logger.info(
-                    "LONG funding-harvest %s | rate=%.4f%% tp=%.4f sl=%.4f",
-                    candle.symbol, float(funding_rate * 100), tp, sl,
+                    "LONG funding-harvest %s | rate=%.4f%% tp=%.4f sl=%.4f score=%.0f",
+                    candle.symbol, float(funding_rate * 100), tp, sl, score,
                 )
                 return Signal(
                     symbol=candle.symbol,
@@ -137,7 +152,7 @@ class FundingRateEngine:
                     size=size,
                     atr=atr_val,
                     timestamp=time.time(),
-                    score=Decimal('80'),
+                    score=score,
                     strategy_name="funding_rate",
                 )
 

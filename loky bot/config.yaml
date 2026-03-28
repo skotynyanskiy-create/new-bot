@@ -54,15 +54,15 @@ strategy:
   funding_threshold: 0.0008      # 0.08% per 8h = attiva harvest
 
   # --- Partial TP (50% TP1, 25% TP2, 25% trail) ---
-  partial_tp1_atr: 1.5
-  partial_tp2_atr: 2.5
-  partial_tp3_atr: 4.0
-  partial_tp1_pct: 0.50
-  partial_tp2_pct: 0.25
-  partial_tp3_pct: 0.25
+  partial_tp1_atr: 2.0
+  partial_tp2_atr: 3.0
+  partial_tp3_atr: 5.0
+  partial_tp1_pct: 0.30
+  partial_tp2_pct: 0.30
+  partial_tp3_pct: 0.40
 
   # --- Signal Scoring ---
-  min_signal_score: 62           # score < 62 → segnale scartato (alta selettività)
+  min_signal_score: 50           # score < 50 → segnale scartato (più trade)
 
   # --- Circuit Breaker ---
   circuit_breaker_losses: 3      # N perdite consecutive → attiva pausa automatica
@@ -75,7 +75,7 @@ strategy:
 risk_per_trade_pct: 0.015        # 1.5% del capitale per trade (Kelly override se attivo)
 max_concurrent_positions: 2
 leverage: 3                      # Leva base (override dinamico se dynamic_leverage_enabled)
-max_daily_loss_pct: 0.03         # 3% del capitale = daily stop più stretto
+max_daily_loss_pct: 0.06         # 6% del capitale = daily stop
 max_position_per_asset: 0.05
 
 # === PORTFOLIO & LEVA DINAMICA ===

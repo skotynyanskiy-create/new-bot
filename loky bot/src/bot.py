@@ -237,6 +237,7 @@ class LokyBot:
         # --- Flag e controlli ---
         self._daily_stop_triggered: bool = False
         self._crisis_block_entry: bool = False  # settato dall'orchestratore in crisis mode
+        self._tp_adjusted: bool = False  # dynamic TP: una sola modifica per trade
         self._cooldown_remaining: int    = 0
         self._pending_signal: Optional[Signal] = None
 
@@ -534,7 +535,7 @@ class LokyBot:
 
         sent_adj = self._sentiment.score_adjustment_for(self.symbol, best.signal_type)
         if sent_adj != 0:
-            best.score = max(_ZERO, best.score + Decimal(str(sent_adj)))
+            best.score = max(_ZERO, min(Decimal('100'), best.score + Decimal(str(sent_adj))))
         if sent_adj > 10:
             best.size = (best.size * Decimal('1.2')).quantize(Decimal('0.001'))
         elif sent_adj < -5:
@@ -699,9 +700,6 @@ class LokyBot:
             return
         if self._position_side is None or self._entry_price <= _ZERO:
             return
-        # Cooldown: aggiorna solo ogni 5 candle e solo se non già aggiornato
-        if not hasattr(self, '_tp_adjusted'):
-            self._tp_adjusted = False
         if self._tp_adjusted:
             return  # Già aggiornato per questo trade, non oscillare
 

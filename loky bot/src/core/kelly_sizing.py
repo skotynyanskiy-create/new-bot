@@ -201,9 +201,9 @@ class KellySizer:
         best_f = Decimal('0.01')
         best_twr = Decimal('1')
 
-        # Cerca in step di 0.01 da 0.01 a 0.30 (max 30% per safety)
-        for f_int in range(1, 31):
-            f = f_int / 100.0
+        # Cerca in step di 0.5% (60 punti) da 0.5% a 30% — 2x risoluzione vs 1%
+        for f_int in range(1, 61):
+            f = f_int / 200.0
             twr = 1.0
             valid = True
             for r in returns:

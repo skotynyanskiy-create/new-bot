@@ -535,7 +535,9 @@ class LokyBot:
 
         sent_adj = self._sentiment.score_adjustment_for(self.symbol, best.signal_type)
         if sent_adj != 0:
-            best.score = max(_ZERO, min(Decimal('100'), best.score + Decimal(str(sent_adj))))
+            # Moltiplicativo: ±15 → fattore [0.85, 1.15] (proporzionale alla confidenza)
+            sent_mult = _ONE + (Decimal(str(sent_adj)) / Decimal('100'))
+            best.score = min(best.score * sent_mult, Decimal('100')).quantize(Decimal('0.1'))
         if sent_adj > 10:
             best.size = (best.size * Decimal('1.2')).quantize(Decimal('0.001'))
         elif sent_adj < -5:
@@ -1136,8 +1138,19 @@ class LokyBot:
         else:
             sl_score_mult = Decimal('1.3')
 
-        # SL su struttura di mercato
-        atr_sl_distance = s.sl_atr_mult * atr * sl_score_mult
+        # Regime detection per risk_mult (usato su SL E TP)
+        regime = self._aggregator.detect_regime()
+        if regime == "STRONG_TREND":
+            risk_mult = Decimal('1.2')
+        elif regime == "RANGING":
+            risk_mult = Decimal('0.8')
+        elif regime == "CHOPPY":
+            risk_mult = Decimal('0.6')
+        else:
+            risk_mult = Decimal('1.0')
+
+        # SL su struttura di mercato (score_mult per confidenza + risk_mult per regime)
+        atr_sl_distance = s.sl_atr_mult * atr * sl_score_mult * risk_mult
 
         if side == Side.BUY:
             atr_sl = fill_price - atr_sl_distance
@@ -1156,23 +1169,11 @@ class LokyBot:
                 self._sl_price = atr_sl
         self._sl_price_orig = self._sl_price
 
-        # Regime-specific TP multiplier: allarga/stringe i target in base al regime
-        regime = self._aggregator.detect_regime()
-        if regime == "STRONG_TREND":
-            tp_mult = Decimal('1.5')  # trend forte: target più lontani
-        elif regime == "RANGING":
-            tp_mult = Decimal('0.7')  # ranging: target più stretti
-        elif regime == "CHOPPY":
-            tp_mult = Decimal('0.5')  # choppy: exit rapido
-        else:
-            tp_mult = Decimal('1.0')
-
-        # 3 livelli di Partial TP (adattati al regime)
-        # TP3 viene affinato usando il livello S/R più vicino nella direzione del trade.
+        # 3 livelli di Partial TP (risk_mult già calcolato sopra — R:R preservato)
         if side == Side.BUY:
-            tp1 = fill_price + s.partial_tp1_atr * atr * tp_mult
-            tp2 = fill_price + s.partial_tp2_atr * atr * tp_mult
-            tp3_atr = fill_price + s.partial_tp3_atr * atr * tp_mult
+            tp1 = fill_price + s.partial_tp1_atr * atr * risk_mult
+            tp2 = fill_price + s.partial_tp2_atr * atr * risk_mult
+            tp3_atr = fill_price + s.partial_tp3_atr * atr * risk_mult
             # Usa la resistenza strutturale più vicina sopra fill_price come TP3 se disponibile
             # e se cade tra TP2 e tp3_atr × 1.5 (non troppo vicino né troppo lontano)
             try:
@@ -1193,9 +1194,9 @@ class LokyBot:
                 TPLevel(tp3, s.partial_tp3_pct),
             ]
         else:
-            tp1 = fill_price - s.partial_tp1_atr * atr * tp_mult
-            tp2 = fill_price - s.partial_tp2_atr * atr * tp_mult
-            tp3_atr = fill_price - s.partial_tp3_atr * atr * tp_mult
+            tp1 = fill_price - s.partial_tp1_atr * atr * risk_mult
+            tp2 = fill_price - s.partial_tp2_atr * atr * risk_mult
+            tp3_atr = fill_price - s.partial_tp3_atr * atr * risk_mult
             # Usa il supporto strutturale più vicino sotto fill_price come TP3 per SHORT
             try:
                 nearest_s = self._indicators.nearest_support_below(fill_price)

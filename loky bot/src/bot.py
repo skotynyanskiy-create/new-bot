@@ -42,6 +42,7 @@ from src.strategy.funding_rate_engine import FundingRateEngine
 from src.strategy.indicator_engine import IndicatorEngine
 from src.strategy.market_sentiment_engine import MarketSentimentEngine
 from src.strategy.mean_reversion_engine import MeanReversionEngine
+from src.gateways.smart_execution import ExecutionAnalytics, SlippageEstimator
 from src.strategy.signal_aggregator import SignalAggregator
 from src.strategy.volatility_engine import VolatilityRegimeEngine
 from src.strategy.trend_following_engine import TrendFollowingEngine
@@ -174,6 +175,12 @@ class LokyBot:
 
         # --- Volatility regime ---
         self._vol_engine = VolatilityRegimeEngine(self._indicators)
+
+        # --- Smart execution ---
+        self._slippage_est = SlippageEstimator(
+            base_slippage_pct=config.slippage_pct,
+        )
+        self._exec_analytics = ExecutionAnalytics()
 
         # --- Kelly Criterion sizing ---
         self._kelly = KellySizer(
@@ -811,11 +818,28 @@ class LokyBot:
             self._state = BotState.FLAT
             return
 
+        # Slippage estimation: verifica e adatta la size se slippage eccessivo
+        try:
+            vol_ma = self._indicators.volume_ma()
+            ok, est_slip = self._slippage_est.is_acceptable(signal.entry_price, signal.size, vol_ma)
+            if not ok:
+                adjusted = self._slippage_est.adjusted_size(signal.entry_price, signal.size, vol_ma)
+                if adjusted <= _ZERO:
+                    logger.warning(
+                        "%s Slippage troppo alto (%.2f%%) — entry annullata.",
+                        self.symbol, float(est_slip * 100),
+                    )
+                    self._state = BotState.FLAT
+                    return
+                signal.size = adjusted
+        except ValueError:
+            est_slip = self._cfg.slippage_pct
+
         logger.info(
-            "%s [Loky] ENTRATA %s (%s) | entry≈%.4f tp=%.4f sl=%.4f size=%.3f score=%.0f",
+            "%s [Loky] ENTRATA %s (%s) | entry≈%.4f tp=%.4f sl=%.4f size=%.3f score=%.0f slip≈%.2f%%",
             self.symbol, signal.signal_type.name, signal.strategy_name,
             signal.entry_price, signal.take_profit, signal.stop_loss,
-            signal.size, signal.score,
+            signal.size, signal.score, float(est_slip * 100),
         )
 
         if not self._cfg.live_trading_enabled:

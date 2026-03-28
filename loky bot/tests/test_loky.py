@@ -742,3 +742,77 @@ class TestVolatilityRegimeEngine:
         ind = IndicatorEngine()
         engine = VolatilityRegimeEngine(ind)
         assert engine.regime_name == "normal"
+
+
+# ================================================================== #
+#  FASE 5 — ESECUZIONE AVANZATA                                      #
+# ================================================================== #
+
+class TestSlippageEstimator:
+    """Verifica la stima dello slippage pre-trade."""
+
+    def test_base_slippage_no_volume(self):
+        from src.gateways.smart_execution import SlippageEstimator
+        est = SlippageEstimator(base_slippage_pct=Decimal("0.0005"))
+        slip = est.estimate(Decimal("100"), Decimal("1"), Decimal("0"))
+        assert slip == Decimal("0.0005")
+
+    def test_slippage_increases_with_size(self):
+        from src.gateways.smart_execution import SlippageEstimator
+        est = SlippageEstimator(base_slippage_pct=Decimal("0.0005"))
+        small = est.estimate(Decimal("100"), Decimal("0.01"), Decimal("1000"))
+        large = est.estimate(Decimal("100"), Decimal("10"), Decimal("1000"))
+        assert large > small
+
+    def test_acceptable_slippage(self):
+        from src.gateways.smart_execution import SlippageEstimator
+        est = SlippageEstimator(
+            base_slippage_pct=Decimal("0.0005"),
+            max_acceptable_pct=Decimal("0.002"),
+        )
+        ok, slip = est.is_acceptable(Decimal("100"), Decimal("0.01"), Decimal("1000"))
+        assert ok is True
+
+    def test_adjusted_size_reduces_when_needed(self):
+        from src.gateways.smart_execution import SlippageEstimator
+        est = SlippageEstimator(
+            base_slippage_pct=Decimal("0.0005"),
+            max_acceptable_pct=Decimal("0.0006"),  # soglia molto stretta
+        )
+        adjusted = est.adjusted_size(Decimal("100"), Decimal("100"), Decimal("10"))
+        assert adjusted < Decimal("100")  # deve ridurre
+
+
+class TestExecutionAnalytics:
+    """Verifica il tracking delle execution analytics."""
+
+    def test_record_and_stats(self):
+        from src.gateways.smart_execution import ExecutionAnalytics
+        analytics = ExecutionAnalytics()
+        analytics.record(
+            symbol="BTCUSDT", side=Side.BUY,
+            expected_price=Decimal("100"), actual_price=Decimal("100.05"),
+            size=Decimal("1"), estimated_slippage=Decimal("0.001"),
+            execution_method="market",
+        )
+        stats = analytics.stats()
+        assert stats["n_executions"] == 1
+        assert stats["market_orders"] == 1
+        assert stats["avg_slippage_pct"] > 0
+
+    def test_empty_analytics(self):
+        from src.gateways.smart_execution import ExecutionAnalytics
+        analytics = ExecutionAnalytics()
+        assert analytics.avg_slippage == Decimal("0")
+        assert analytics.estimation_accuracy == Decimal("1")
+
+
+class TestTWAPVolumeWeighted:
+    """Verifica che il TWAP supporti pesi volume."""
+
+    def test_twap_accepts_volume_weights(self):
+        """Verifica che place_twap_order accetti volume_weights come parametro."""
+        import inspect
+        from src.state.order_manager import OrderManager as OM
+        sig = inspect.signature(OM.place_twap_order)
+        assert "volume_weights" in sig.parameters

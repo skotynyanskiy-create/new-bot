@@ -308,6 +308,25 @@ class BybitFuturesExecutionGateway(ExecutionGateway):
             logger.error("Errore submit_order: %s", e)
             order.status = OrderStatus.REJECTED
 
+    async def submit_limit_order_raw(
+        self, symbol: str, side: Side, size: Decimal, price: Decimal
+    ) -> Optional[Order]:
+        """Invia limit order e ritorna Order (per AggressiveChaser)."""
+        import uuid
+        order = Order(
+            id=str(uuid.uuid4()),
+            symbol=symbol,
+            side=side,
+            price=price,
+            size=size,
+            status=OrderStatus.PENDING,
+            filled_size=Decimal("0"),
+        )
+        await self.submit_order(order)
+        if order.status == OrderStatus.REJECTED:
+            return None
+        return order
+
     async def cancel_order(self, order: Order) -> None:
         body = {
             "category": "linear",

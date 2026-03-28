@@ -551,9 +551,15 @@ class LokyBot:
             return False
 
         # --- Size modifiers ---
+        # Score-adaptive size: alta confidenza → boost, bassa → riduzione
+        if best.score >= Decimal('85'):
+            best.size = (best.size * Decimal('1.15')).quantize(Decimal('0.001'))
+        elif best.score < Decimal('70'):
+            best.size = (best.size * Decimal('0.85')).quantize(Decimal('0.001'))
+
         best.size = self._apply_streak_sizing(best.size)
 
-        # Cap cumulative modifiers a 40% dell'originale
+        # Cap cumulative modifiers a 40% dell'originale (INCLUDE score boost)
         min_size = (pre_size * Decimal('0.40')).quantize(Decimal('0.001'))
         if best.size < min_size and min_size > _ZERO:
             best.size = min_size
@@ -684,17 +690,26 @@ class LokyBot:
 
     def _update_dynamic_tp(self, candle: Candle) -> None:
         """
-        Adatta i TP levels al momentum del trade in corso.
-        - Forte profitto pre-TP1 → estendi TP3 (cattura più trend)
-        - Trade stagnante → stringi TP2/TP3 (esci prima)
-        NON tocca TP1 (primo lock è sacro).
+        Adatta i TP levels al momentum — UNA SOLA VOLTA per trade.
+        Previene oscillazione: una volta che TP3 è esteso o stretto, non si cambia più.
         """
         if not self._tp_levels or len(self._tp_levels) < 3:
             return
         if self._tp_levels[0].hit:
-            return  # Dopo TP1 hit, i target restano fissi (trail gestisce il resto)
+            return
         if self._position_side is None or self._entry_price <= _ZERO:
             return
+        # Cooldown: aggiorna solo ogni 5 candle e solo se non già aggiornato
+        if not hasattr(self, '_tp_adjusted'):
+            self._tp_adjusted = False
+        if self._tp_adjusted:
+            return  # Già aggiornato per questo trade, non oscillare
+
+        # Attendi almeno 5 candle dall'entry prima di valutare
+        if self._entry_time > 0:
+            candles_since_entry = (candle.timestamp - self._entry_time) / 900  # 15m candle
+            if candles_since_entry < 5:
+                return
 
         try:
             atr = self._indicators.atr()
@@ -707,19 +722,22 @@ class LokyBot:
         else:
             profit_pct = (self._entry_price - candle.close) / self._entry_price
 
-        # Forte profitto (>2%) pre-TP1: estendi TP3 di +0.5×ATR
+        # Forte profitto (>2%): estendi TP3 una volta
         if profit_pct > Decimal('0.02'):
             if is_long:
-                new_tp3 = self._tp_levels[2].price + atr * Decimal('0.5')
-                if new_tp3 > self._tp_levels[2].price:
-                    self._tp_levels[2] = TPLevel(new_tp3, self._tp_levels[2].qty_fraction)
+                self._tp_levels[2] = TPLevel(
+                    self._tp_levels[2].price + atr * Decimal('0.5'),
+                    self._tp_levels[2].qty_fraction,
+                )
             else:
-                new_tp3 = self._tp_levels[2].price - atr * Decimal('0.5')
-                if new_tp3 < self._tp_levels[2].price:
-                    self._tp_levels[2] = TPLevel(new_tp3, self._tp_levels[2].qty_fraction)
+                self._tp_levels[2] = TPLevel(
+                    self._tp_levels[2].price - atr * Decimal('0.5'),
+                    self._tp_levels[2].qty_fraction,
+                )
+            self._tp_adjusted = True
 
-        # Trade stagnante (-0.5% a +0.5% per 5+ candle): stringi TP2/TP3 del 15%
-        elif abs(profit_pct) < Decimal('0.005') and self._candle_count > 5:
+        # Stagnante (±0.3%): stringi TP2/TP3 una volta
+        elif abs(profit_pct) < Decimal('0.003'):
             shrink = Decimal('0.85')
             if is_long:
                 new_tp2 = self._entry_price + (self._tp_levels[1].price - self._entry_price) * shrink
@@ -729,6 +747,7 @@ class LokyBot:
                 new_tp3 = self._entry_price - (self._entry_price - self._tp_levels[2].price) * shrink
             self._tp_levels[1] = TPLevel(new_tp2, self._tp_levels[1].qty_fraction)
             self._tp_levels[2] = TPLevel(new_tp3, self._tp_levels[2].qty_fraction)
+            self._tp_adjusted = True
 
     def _update_trailing_sl(self, candle: Candle) -> None:
         """
@@ -1109,23 +1128,17 @@ class LokyBot:
         atr = signal.atr
         s   = self._cfg.strategy
 
-        # Score-adaptive entry: segnali ad alta confidenza → SL stretto + size boost
-        # Segnali deboli → SL largo + size ridotta (conservativo)
+        # Score-adaptive SL: alta confidenza → SL stretto, bassa → SL largo
+        # (Size boost spostato in _apply_signal_modifiers() per rispettare il 40% cap)
         score = signal.score
         if score >= Decimal('85'):
-            sl_score_mult = Decimal('0.8')   # SL stretto: alta confidenza
-            size_score_mult = Decimal('1.15') # Size +15%
+            sl_score_mult = Decimal('0.8')
         elif score >= Decimal('70'):
-            sl_score_mult = _ONE              # SL standard
-            size_score_mult = _ONE
+            sl_score_mult = _ONE
         else:
-            sl_score_mult = Decimal('1.3')   # SL largo: bassa confidenza
-            size_score_mult = Decimal('0.85') # Size -15%
+            sl_score_mult = Decimal('1.3')
 
-        self._position_size = (self._position_size * size_score_mult).quantize(Decimal('0.001'))
-        self._position_size_orig = self._position_size
-
-        # SL su struttura di mercato: il più lontano tra ATR-based e swing structure.
+        # SL su struttura di mercato
         atr_sl_distance = s.sl_atr_mult * atr * sl_score_mult
 
         if side == Side.BUY:
@@ -1827,6 +1840,7 @@ class LokyBot:
         self._sl_price            = _ZERO
         self._sl_price_orig       = _ZERO
         self._tp_levels           = []
+        self._tp_adjusted         = False
         self._pending_signal      = None
         self._scale_in_count      = 0
         self._scale_in_size       = _ZERO

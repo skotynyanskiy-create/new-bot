@@ -329,9 +329,9 @@ class SignalAggregator:
         """
         for name, stats in self._strategy_stats.items():
             total = stats["wins"] + stats["losses"]
-            if total < 5:
+            if total < 10:
                 self._strategy_weight_cache[name] = _ONE
-                continue
+                continue  # Dati insufficienti per expectancy stabile
 
             win_rate = Decimal(stats["wins"]) / Decimal(total)
             loss_rate = _ONE - win_rate

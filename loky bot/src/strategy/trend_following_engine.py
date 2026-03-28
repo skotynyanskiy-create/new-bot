@@ -100,7 +100,11 @@ class TrendFollowingEngine:
             sl    = entry - self._cfg.tf_sl_atr_mult * atr_val
             # Score dinamico: pullback profondo (vicino a EMA21) → score più alto (entry migliore)
             # Skip se EMAs collassate (< 0.1% spread → trend debole, non entrare)
-            if abs(e8 - e21) < candle.close * Decimal('0.001'):
+            # Guard dinamico: ADX alto → EMA strette = pullback valido (threshold largo)
+            # ADX basso → EMA strette = trend debole (threshold stretto)
+            adx_norm = min(adx_val / Decimal('50'), Decimal('1'))
+            ema_spread_threshold = Decimal('0.001') + (adx_norm * Decimal('0.003'))
+            if abs(e8 - e21) < candle.close * ema_spread_threshold:
                 return self._no_signal(candle)
             depth_ratio = (e8 - candle.close) / (e8 - e21)
             score = Decimal('72') + min(depth_ratio * Decimal('8'), Decimal('8'))
@@ -136,7 +140,11 @@ class TrendFollowingEngine:
             entry = candle.close
             tp    = entry - self._cfg.tf_tp_atr_mult * atr_val
             sl    = entry + self._cfg.tf_sl_atr_mult * atr_val
-            if abs(e8 - e21) < candle.close * Decimal('0.001'):
+            # Guard dinamico: ADX alto → EMA strette = pullback valido (threshold largo)
+            # ADX basso → EMA strette = trend debole (threshold stretto)
+            adx_norm = min(adx_val / Decimal('50'), Decimal('1'))
+            ema_spread_threshold = Decimal('0.001') + (adx_norm * Decimal('0.003'))
+            if abs(e8 - e21) < candle.close * ema_spread_threshold:
                 return self._no_signal(candle)
             depth_ratio = (candle.close - e8) / (e21 - e8)
             score = Decimal('72') + min(depth_ratio * Decimal('8'), Decimal('8'))

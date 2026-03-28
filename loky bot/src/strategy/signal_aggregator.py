@@ -240,8 +240,9 @@ class SignalAggregator:
             + macd_bonus + stoch_bonus
         )
 
-        # Blend: 75% engine base + 25% contesto
-        blended = base * Decimal('0.75') + context_score * Decimal('0.25')
+        # Blend 50/50: engine e contesto hanno qualità comparabile
+        # (contesto include MACD, StochRSI, confluence TF, volume log, adaptive weights)
+        blended = base * Decimal('0.50') + context_score * Decimal('0.50')
         final_score = max(_ZERO, min(blended, _HUNDRED))
         return final_score.quantize(Decimal('0.1'))
 

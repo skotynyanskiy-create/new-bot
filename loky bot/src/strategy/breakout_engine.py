@@ -25,6 +25,7 @@ from decimal import Decimal
 from src.config import BotSettings
 from src.models import Candle, Signal, SignalType
 from src.strategy.indicator_engine import IndicatorEngine
+from src.strategy.sizing import calc_risk_size
 
 logger = logging.getLogger(__name__)
 
@@ -202,35 +203,11 @@ class BreakoutEngine:
         return candle.volume >= self._cfg.volume_multiplier * vol_ma
 
     def _calc_size(self, atr: Decimal, price: Decimal) -> Decimal:
-        """
-        size = (capitale × risk_pct) / (sl_atr_mult × ATR)
-        Limita a: notional <= capitale × leva
-        Valida: notional >= _MIN_NOTIONAL (minimo Binance Futures $6)
-        """
-        risk_usdt   = self._capital * self._top_cfg.risk_per_trade_pct
         sl_distance = self._cfg.sl_atr_mult * atr
-        if sl_distance == _ZERO or price == _ZERO:
-            return _ZERO
-
-        raw_size = risk_usdt / sl_distance
-
-        # Limita a notional massimo = capitale × leva
-        max_notional = self._capital * Decimal(str(self._top_cfg.leverage))
-        max_size     = max_notional / price
-        size         = min(raw_size, max_size)
-
-        # Arrotonda a 3 decimali (step size comune per BTC/ETH Futures)
-        size = size.quantize(Decimal('0.001'))
-
-        # Verifica notional minimo Binance Futures
-        if size * price < _MIN_NOTIONAL:
-            logger.debug(
-                "Size %.6f troppo piccola (notional=%.2f USDT < %.0f USDT min). Segnale scartato.",
-                size, float(size * price), float(_MIN_NOTIONAL),
-            )
-            return _ZERO
-
-        return size
+        return calc_risk_size(
+            self._capital, self._top_cfg.risk_per_trade_pct,
+            sl_distance, self._top_cfg.leverage, price,
+        )
 
     @staticmethod
     def _no_signal(candle: Candle | None) -> Signal:

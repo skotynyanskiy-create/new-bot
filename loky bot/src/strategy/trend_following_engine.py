@@ -23,6 +23,7 @@ from decimal import Decimal
 from src.config import BotSettings
 from src.models import Candle, Signal, SignalType
 from src.strategy.indicator_engine import IndicatorEngine
+from src.strategy.sizing import calc_risk_size
 
 logger = logging.getLogger(__name__)
 
@@ -165,19 +166,11 @@ class TrendFollowingEngine:
     # ------------------------------------------------------------------
 
     def _calc_size(self, atr: Decimal, price: Decimal, sl_mult: Decimal) -> Decimal:
-        risk_usdt   = self._capital * self._top_cfg.risk_per_trade_pct
         sl_distance = sl_mult * atr
-        if sl_distance == _ZERO or price == _ZERO:
-            return _ZERO
-
-        raw_size     = risk_usdt / sl_distance
-        max_notional = self._capital * Decimal(str(self._top_cfg.leverage))
-        max_size     = max_notional / price
-        size         = min(raw_size, max_size).quantize(Decimal('0.001'))
-
-        if size * price < _MIN_NOTIONAL:
-            return _ZERO
-        return size
+        return calc_risk_size(
+            self._capital, self._top_cfg.risk_per_trade_pct,
+            sl_distance, self._top_cfg.leverage, price,
+        )
 
     @staticmethod
     def _no_signal(candle: Candle | None) -> Signal:

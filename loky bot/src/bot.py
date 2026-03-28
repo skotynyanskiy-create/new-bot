@@ -236,6 +236,7 @@ class LokyBot:
 
         # --- Flag e controlli ---
         self._daily_stop_triggered: bool = False
+        self._crisis_block_entry: bool = False  # settato dall'orchestratore in crisis mode
         self._cooldown_remaining: int    = 0
         self._pending_signal: Optional[Signal] = None
 
@@ -394,6 +395,10 @@ class LokyBot:
             return
 
         if self._state != BotState.FLAT:
+            return
+
+        # Blocco crisis mode: orchestratore ha rilevato crash BTC
+        if self._crisis_block_entry:
             return
 
         # Blocco esplicito regime CHOPPY: nessun trade ammesso (ADX < 15)
@@ -761,8 +766,9 @@ class LokyBot:
                 return
 
         # --- TTL-based TP scaling: target si stringono col tempo ---
-        # Dopo 2/3 del max hold time, chiudi qualsiasi profitto > 0.5×ATR
-        if self._entry_time > 0:
+        # Solo se NESSUN partial TP è già stato hit (altrimenti lascia il TP flow gestire)
+        any_tp_hit = any(tp.hit for tp in self._tp_levels) if self._tp_levels else False
+        if self._entry_time > 0 and not any_tp_hit:
             hold_seconds = time.time() - self._entry_time
             max_hold_s = self._cfg.strategy.max_hold_hours * 3600
             hold_ratio = hold_seconds / max_hold_s if max_hold_s > 0 else 0
@@ -806,12 +812,15 @@ class LokyBot:
             await self._close_partial(tp_fill, close_size, f"TP{i+1} (paper)")
             tp_lvl.hit = True
 
-            # Dopo TP1 → SL a breakeven
+            # Dopo TP1 → SL a breakeven + buffer per coprire slippage
+            # Il buffer (0.1% del prezzo) evita che lo slippage paper trasformi
+            # un exit "a breakeven" in una micro-perdita
             if i == 0:
+                slip_buffer = self._entry_price * Decimal('0.001')
                 if is_long:
-                    self._sl_price = max(self._sl_price, self._entry_price)
+                    self._sl_price = max(self._sl_price, self._entry_price + slip_buffer)
                 else:
-                    self._sl_price = min(self._sl_price, self._entry_price)
+                    self._sl_price = min(self._sl_price, self._entry_price - slip_buffer)
                 logger.info("%s SL spostato a breakeven: %.4f", self.symbol, self._sl_price)
 
             if self._position_size <= _ZERO:

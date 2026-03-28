@@ -15,6 +15,7 @@ import logging
 import signal
 import sys
 import time
+from collections import deque
 from decimal import Decimal
 from typing import Optional
 
@@ -160,14 +161,16 @@ class FuturesOrchestrator:
             self._btc_prices.append(candle.close)
             await self._check_btc_crash(candle)
 
-        # Se in crisis mode, blocca entry su altcoin
+        # Crisis mode: setta flag sui bot altcoin per bloccare SOLO nuove entry
+        # ma permettere gestione TP/SL/trailing sulle posizioni aperte
         if self._crisis_mode and time.time() < self._crisis_until:
-            if symbol != "BTCUSDT":
-                bot = self._bots.get(symbol)
-                if bot and bot._state == BotState.FLAT:
-                    return  # skip candle per altcoin in crisis mode
+            for sym, b in self._bots.items():
+                if sym != "BTCUSDT":
+                    b._crisis_block_entry = True
         elif self._crisis_mode and time.time() >= self._crisis_until:
             self._crisis_mode = False
+            for b in self._bots.values():
+                b._crisis_block_entry = False
             logger.info("BTC crash protection: crisis mode disattivato, trading riprende.")
             self._fire_and_forget(self._notifier.info("🟢 Crisis mode terminato. Trading riprende."))
 

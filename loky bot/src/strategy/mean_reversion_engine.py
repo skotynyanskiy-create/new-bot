@@ -105,11 +105,16 @@ class MeanReversionEngine:
 
         base_score = Decimal('65')
 
+        # Tolerance dinamica basata su ATR: asset più volatile → tolerance più stretta
+        # (la BB è già scalata per volatilità, tolerance fissa aggiunge rumore)
+        atr_pct = atr_val / candle.close if candle.close > _ZERO else Decimal('0.005')
+        bb_tolerance = Decimal('1') + min(atr_pct * Decimal('0.3'), Decimal('0.005'))
+
         # ---- LONG (rimbalzo da BB lower) --------------------------------
         if (
             adx_ok
             and volume_ok
-            and candle.close <= bb_lower * Decimal('1.002')
+            and candle.close <= bb_lower * bb_tolerance
             and rsi_val < self._cfg.mr_rsi_oversold
             and ema_fast > ema_slow * Decimal('0.995')
         ):
@@ -142,7 +147,7 @@ class MeanReversionEngine:
         if (
             adx_ok
             and volume_ok
-            and candle.close >= bb_upper * Decimal('0.998')
+            and candle.close >= bb_upper * (Decimal('2') - bb_tolerance)
             and rsi_val > self._cfg.mr_rsi_overbought
             and ema_fast < ema_slow * Decimal('1.005')
         ):

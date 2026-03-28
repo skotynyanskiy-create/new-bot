@@ -364,14 +364,19 @@ class LokyBot:
             # Gap validation: se il prezzo di apertura è troppo lontano dall'entry previsto,
             # scarta il segnale (il mercato è gappato, il setup non è più valido)
             gap = abs(candle.open - sig.entry_price)
-            max_gap = sig.atr * Decimal('2') if sig.atr > _ZERO else sig.entry_price * Decimal('0.02')
+            max_gap = sig.atr if sig.atr > _ZERO else sig.entry_price * Decimal('0.01')
             if gap > max_gap:
                 logger.info(
-                    "%s Next-candle entry scartata: gap %.4f > max %.4f (2×ATR). "
-                    "Open=%.4f vs signal entry=%.4f",
-                    self.symbol, gap, max_gap, candle.open, sig.entry_price,
+                    "%s Next-candle entry scartata: gap %.4f > 1×ATR %.4f.",
+                    self.symbol, gap, max_gap,
                 )
                 return
+            # Recalcola TP/SL relativi al prezzo di entry reale (candle.open)
+            # per mantenere lo stesso R:R del segnale originale
+            price_shift = candle.open - sig.entry_price
+            sig.take_profit += price_shift
+            sig.stop_loss += price_shift
+            sig.entry_price = candle.open
             await self._enter_position(sig, fill_price_override=candle.open)
             return
 
@@ -416,9 +421,7 @@ class LokyBot:
 
         # --- Volatility regime filter: blocca entry in squeeze/gap ---
         vol_regime = self._vol_engine.detect()
-        if vol_regime == VolatilityRegime.CONTRACTION:
-            # Trend esaurito: accetta solo TrendFollowing con score alto
-            pass  # filtraggio avviene sotto
+        self._current_vol_regime = vol_regime  # cache per uso downstream
         # Gap protection pre-entry: se l'ultima candle ha un gap > 2×ATR, skip
         if len(self._candles) >= 2:
             try:
@@ -449,6 +452,13 @@ class LokyBot:
 
         if not signals:
             return
+
+        # Volatility contraction filter: solo trend_following con score alto
+        if hasattr(self, '_current_vol_regime') and self._current_vol_regime == VolatilityRegime.CONTRACTION:
+            signals = [s for s in signals if s.strategy_name == "trend_following" and s.score >= Decimal('75')]
+            if not signals:
+                logger.debug("%s Contraction regime: no high-confidence TF signals, skip.", self.symbol)
+                return
 
         # Seleziona il miglior segnale con scoring
         best = self._aggregator.select_best(signals)
@@ -628,6 +638,16 @@ class LokyBot:
             ema_s = self._macro_indicators.ema_slow()
         except ValueError:
             return True
+
+        # Threshold minimo: se spread < 0.2% del prezzo, macro è neutro → blocca
+        if ema_s > _ZERO:
+            spread_pct = abs(ema_f - ema_s) / ema_s
+            if spread_pct < Decimal('0.002'):
+                logger.debug(
+                    "%s Macro trend neutro (spread=%.3f%% < 0.2%%), segnale bloccato.",
+                    self.symbol, float(spread_pct * 100),
+                )
+                return False
 
         if signal_type == SignalType.LONG:
             aligned = ema_f > ema_s

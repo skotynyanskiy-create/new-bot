@@ -155,12 +155,10 @@ class SignalAggregator:
                     ema_spread = (htf_fast - htf_slow) / htf_slow
                     if signal.signal_type == SignalType.SHORT:
                         ema_spread = -ema_spread
-                    # Allineato: 0 a +25, Contrario: 0 a -15
-                    if ema_spread > _ZERO:
-                        htf_score = min(ema_spread * Decimal('2500'), Decimal('25'))
+                    # Simmetrico: ±20 (stessa penalità per contrario e premio per allineato)
+                    htf_score = min(max(ema_spread * Decimal('2000'), Decimal('-20')), Decimal('20'))
+                    if ema_spread > Decimal('0.001'):  # >0.1% spread = definitivamente allineato
                         htf_aligned = True
-                    else:
-                        htf_score = max(ema_spread * Decimal('1500'), Decimal('-15'))
             except ValueError:
                 pass
 
@@ -213,8 +211,8 @@ class SignalAggregator:
         # Score contestuale (0-100)
         context_score = trend_score + htf_score + confluence_score + vol_score + strat_score
 
-        # Blend: 60% engine base + 40% contesto (evita che il contesto sovrascriva un buon segnale)
-        blended = base * Decimal('0.6') + context_score * Decimal('0.4')
+        # Blend: 75% engine base + 25% contesto (engine signals sono calibrati, contesto è rumore)
+        blended = base * Decimal('0.75') + context_score * Decimal('0.25')
         final_score = max(_ZERO, min(blended, _HUNDRED))
         return final_score.quantize(Decimal('0.1'))
 

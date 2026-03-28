@@ -98,7 +98,10 @@ class TrendFollowingEngine:
             tp    = entry + self._cfg.tf_tp_atr_mult * atr_val
             sl    = entry - self._cfg.tf_sl_atr_mult * atr_val
             # Score dinamico: pullback profondo (vicino a EMA21) → score più alto (entry migliore)
-            depth_ratio = (e8 - candle.close) / (e8 - e21) if e8 != e21 else Decimal('0.5')
+            # Skip se EMAs collassate (< 0.1% spread → trend debole, non entrare)
+            if abs(e8 - e21) < candle.close * Decimal('0.001'):
+                return self._no_signal(candle)
+            depth_ratio = (e8 - candle.close) / (e8 - e21)
             score = Decimal('72') + min(depth_ratio * Decimal('8'), Decimal('8'))
             size  = self._calc_size(atr_val, entry, self._cfg.tf_sl_atr_mult)
             if size > _ZERO:
@@ -132,7 +135,9 @@ class TrendFollowingEngine:
             entry = candle.close
             tp    = entry - self._cfg.tf_tp_atr_mult * atr_val
             sl    = entry + self._cfg.tf_sl_atr_mult * atr_val
-            depth_ratio = (candle.close - e8) / (e21 - e8) if e21 != e8 else Decimal('0.5')
+            if abs(e8 - e21) < candle.close * Decimal('0.001'):
+                return self._no_signal(candle)
+            depth_ratio = (candle.close - e8) / (e21 - e8)
             score = Decimal('72') + min(depth_ratio * Decimal('8'), Decimal('8'))
             size  = self._calc_size(atr_val, entry, self._cfg.tf_sl_atr_mult)
             if size > _ZERO:

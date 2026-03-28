@@ -282,6 +282,58 @@ class IndicatorEngine:
         return (self._bb_upper_val - self._bb_lower_val) / self._bb_middle_val
 
     # ------------------------------------------------------------------
+    # Keltner Channel & Squeeze
+    # ------------------------------------------------------------------
+
+    def keltner_upper(self, mult: Decimal = Decimal('1.5')) -> Decimal:
+        """Keltner upper = EMA20 + mult × ATR."""
+        ema = self.bb_middle()  # EMA20 (stessa base delle BB)
+        atr = self.atr()
+        return ema + mult * atr
+
+    def keltner_lower(self, mult: Decimal = Decimal('1.5')) -> Decimal:
+        """Keltner lower = EMA20 - mult × ATR."""
+        ema = self.bb_middle()
+        atr = self.atr()
+        return ema - mult * atr
+
+    def is_squeeze(self) -> bool:
+        """
+        Bollinger Bands Squeeze: BB dentro il Keltner Channel.
+        Quando BB upper < Keltner upper AND BB lower > Keltner lower,
+        la volatilità è compressa → breakout imminente.
+
+        Usato come trigger per entry su breakout strategy.
+        """
+        try:
+            return (
+                self.bb_upper() < self.keltner_upper()
+                and self.bb_lower() > self.keltner_lower()
+            )
+        except ValueError:
+            return False
+
+    def squeeze_release(self) -> Optional[str]:
+        """
+        Detecta il rilascio dello squeeze (BB esce dal Keltner).
+        Ritorna 'bullish' se il prezzo è sopra BB middle, 'bearish' se sotto.
+        """
+        try:
+            if not self.is_squeeze():
+                # Non in squeeze — controlla se appena uscito
+                bb_w = self.bb_width()
+                if bb_w < Decimal('0.02'):  # ancora compresso ma uscendo
+                    return None
+                # Direzione del breakout
+                if self._candles and self._candles[-1].close > self.bb_middle():
+                    return "bullish"
+                elif self._candles and self._candles[-1].close < self.bb_middle():
+                    return "bearish"
+        except ValueError:
+            pass
+        return None
+
+    # ------------------------------------------------------------------
     # Proprietà pubbliche — EMA Ribbon
     # ------------------------------------------------------------------
 

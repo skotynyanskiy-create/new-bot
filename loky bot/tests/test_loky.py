@@ -972,3 +972,113 @@ class TestDailyStopCarryOver:
         arm._day_start = 0
         arm._maybe_reset_daily()
         assert arm._realized_pnl_day == Decimal("0")
+
+
+# ================================================================== #
+#  FASE 8 — CORRELAZIONE DINAMICA, ORDER FLOW, KELTNER               #
+# ================================================================== #
+
+class TestDynamicCorrelation:
+    """Verifica la correlazione Spearman rolling."""
+
+    def test_perfect_correlation_blocked(self):
+        from src.core.portfolio_risk import PortfolioRiskManager
+        pm = PortfolioRiskManager(capital=Decimal("1000"))
+        # Registra rendimenti identici (correlazione = 1.0)
+        for i in range(30):
+            pm.record_return("BTCUSDT", float(i) * 0.01)
+            pm.record_return("ETHUSDT", float(i) * 0.01)
+        pm.register_open("BTCUSDT", Decimal("500"))
+        blocked, reason = pm.is_correlated_with_open("ETHUSDT")
+        assert blocked is True
+        assert "Spearman" in reason
+
+    def test_uncorrelated_allowed(self):
+        import random
+        from src.core.portfolio_risk import PortfolioRiskManager
+        pm = PortfolioRiskManager(capital=Decimal("1000"))
+        rng = random.Random(42)
+        for _ in range(30):
+            pm.record_return("BTCUSDT", rng.gauss(0, 1))
+            pm.record_return("SOLUSDT", rng.gauss(0, 1))
+        pm.register_open("BTCUSDT", Decimal("500"))
+        blocked, _ = pm.is_correlated_with_open("SOLUSDT")
+        assert blocked is False  # random data = low correlation
+
+    def test_insufficient_data_uses_static_groups(self):
+        from src.core.portfolio_risk import PortfolioRiskManager
+        pm = PortfolioRiskManager(
+            capital=Decimal("1000"),
+            correlation_groups={"BTCUSDT": 0, "ETHUSDT": 0},
+        )
+        pm.register_open("BTCUSDT", Decimal("500"))
+        # Nessun rendimento rolling → fallback a gruppi statici
+        blocked, reason = pm.is_correlated_with_open("ETHUSDT")
+        assert blocked is True
+        assert "statico" in reason
+
+
+class TestOrderFlowEngine:
+    """Verifica l'Order Flow Engine."""
+
+    def test_delta_calculation(self):
+        from src.strategy.orderflow_engine import OrderFlowEngine
+        engine = OrderFlowEngine()
+        # Candela verde con close vicino al high → delta positivo
+        c = Candle(
+            symbol="BTCUSDT", timeframe="15m",
+            open=Decimal("100"), high=Decimal("105"), low=Decimal("99"),
+            close=Decimal("104"), volume=Decimal("1000"),
+            timestamp=time.time(), is_closed=True,
+        )
+        engine.update(c)
+        assert engine.current_delta > Decimal("0")
+
+    def test_cvd_accumulates(self):
+        from src.strategy.orderflow_engine import OrderFlowEngine
+        engine = OrderFlowEngine()
+        for i in range(10):
+            c = Candle(
+                symbol="BTCUSDT", timeframe="15m",
+                open=Decimal("100"), high=Decimal("105"), low=Decimal("99"),
+                close=Decimal("104"), volume=Decimal("100"),
+                timestamp=time.time() + i, is_closed=True,
+            )
+            engine.update(c)
+        assert engine.cvd > Decimal("0")  # tutte candele verdi
+
+    def test_score_modifier_bullish(self):
+        from src.strategy.orderflow_engine import OrderFlowEngine
+        engine = OrderFlowEngine()
+        for i in range(15):
+            c = Candle(
+                symbol="BTCUSDT", timeframe="15m",
+                open=Decimal("100"), high=Decimal("105"), low=Decimal("99"),
+                close=Decimal("104"), volume=Decimal("100"),
+                timestamp=time.time() + i, is_closed=True,
+            )
+            engine.update(c)
+        mod = engine.score_modifier(is_long=True)
+        assert mod >= Decimal("1.0")  # bullish CVD + long = conferma
+
+
+class TestKeltnerSqueeze:
+    """Verifica il Keltner Channel e la detection dello squeeze."""
+
+    def test_keltner_channels_exist(self):
+        ind = IndicatorEngine()
+        candles = make_candles(60)
+        for c in candles:
+            ind.update(c)
+        upper = ind.keltner_upper()
+        lower = ind.keltner_lower()
+        assert upper > lower
+
+    def test_squeeze_detection(self):
+        ind = IndicatorEngine()
+        candles = make_candles(60)
+        for c in candles:
+            ind.update(c)
+        # is_squeeze ritorna bool
+        result = ind.is_squeeze()
+        assert isinstance(result, bool)

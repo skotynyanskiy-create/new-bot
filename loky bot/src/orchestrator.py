@@ -164,6 +164,14 @@ class FuturesOrchestrator:
             except (ValueError, AttributeError):
                 pass  # indicatori non ancora pronti
 
+            # Registra rendimento log per correlazione dinamica rolling
+            if candle.timeframe == config.primary_timeframe and len(bot._candles) >= 2:
+                import math as _math
+                prev = bot._candles[-2].close
+                if prev > 0:
+                    log_ret = _math.log(float(candle.close / prev))
+                    self._portfolio_risk.record_return(symbol, log_ret)
+
     async def _route_order_update(self, order) -> None:
         bot = self._bots.get(order.symbol)
         if bot:
@@ -249,8 +257,11 @@ class FuturesOrchestrator:
 
         # Telegram: polling comandi + daily summary
         if hasattr(self._notifier, 'start_command_polling'):
-            # Inietta callback per /status
+            # Inietta callback per comandi Telegram
             self._notifier.set_status_callback(self._status_text)
+            self._notifier.set_equity_callback(self._equity_text)
+            self._notifier.set_drawdown_callback(self._drawdown_text)
+            self._notifier.set_strategy_callback(self._strategy_text)
             self._tasks.append(asyncio.create_task(
                 self._notifier.start_command_polling(), name="tg_commands"
             ))
@@ -437,6 +448,55 @@ class FuturesOrchestrator:
             f"Posizioni: {', '.join(positions)}\n"
             f"Engines  : {attr_lines}"
         )
+
+    async def _equity_text(self) -> str:
+        """Genera testo equity per /equity."""
+        total_pnl = sum(bot.realized_pnl for bot in self._bots.values())
+        unrealized = sum(bot.unrealized_pnl for bot in self._bots.values())
+        equity = self._capital + total_pnl
+        lines = [
+            f"Capitale iniziale: {float(self._capital):.2f} USDT",
+            f"Equity corrente : {float(equity):.2f} USDT",
+            f"PnL realizzato  : {float(total_pnl):+.4f} USDT",
+            f"PnL non realiz. : {float(unrealized):+.4f} USDT",
+            f"Return          : {float(total_pnl / self._capital * 100):+.2f}%",
+        ]
+        # Per-symbol breakdown
+        for sym, bot in self._bots.items():
+            lines.append(f"  {sym}: {float(bot.realized_pnl):+.4f} USDT")
+        return "\n".join(lines)
+
+    async def _drawdown_text(self) -> str:
+        """Genera testo drawdown per /drawdown."""
+        dd_pct = self._account_risk.current_drawdown_pct
+        daily_pnl = self._account_risk.daily_pnl
+        peak_active = self._account_risk.peak_drawdown_active
+        return (
+            f"Drawdown corrente: {float(dd_pct * 100):.1f}%\n"
+            f"PnL giornaliero : {float(daily_pnl):+.4f} USDT\n"
+            f"Peak DD stop    : {'🔴 ATTIVO' if peak_active else '🟢 OK'}\n"
+            f"Daily stop      : {'🔴 ATTIVO' if self._account_risk._stop_triggered else '🟢 OK'}"
+        )
+
+    async def _strategy_text(self) -> str:
+        """Genera testo per /strategy — performance per engine."""
+        from collections import defaultdict
+        pnl_map: dict[str, float] = defaultdict(float)
+        trades_map: dict[str, int] = defaultdict(int)
+        for bot in self._bots.values():
+            for strat, pnl in bot.pnl_by_strategy.items():
+                pnl_map[strat] += float(pnl)
+            for strat, cnt in bot.trades_by_strategy.items():
+                trades_map[strat] += cnt
+        if not pnl_map:
+            return "Nessun trade eseguito."
+        lines = []
+        for strat in sorted(pnl_map.keys()):
+            pnl = pnl_map[strat]
+            trades = trades_map.get(strat, 0)
+            icon = "✅" if pnl > 0 else "❌"
+            lines.append(f"{icon} {strat}: {pnl:+.2f} USDT ({trades} trade)")
+        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

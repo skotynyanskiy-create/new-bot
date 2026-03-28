@@ -43,6 +43,7 @@ from src.strategy.indicator_engine import IndicatorEngine
 from src.strategy.market_sentiment_engine import MarketSentimentEngine
 from src.strategy.mean_reversion_engine import MeanReversionEngine
 from src.gateways.smart_execution import ExecutionAnalytics, SlippageEstimator
+from src.strategy.orderflow_engine import OrderFlowEngine
 from src.strategy.signal_aggregator import SignalAggregator
 from src.strategy.volatility_engine import VolatilityRegimeEngine
 from src.strategy.trend_following_engine import TrendFollowingEngine
@@ -176,6 +177,9 @@ class LokyBot:
         # --- Volatility regime ---
         self._vol_engine = VolatilityRegimeEngine(self._indicators)
 
+        # --- Order flow ---
+        self._orderflow = OrderFlowEngine()
+
         # --- Smart execution ---
         self._slippage_est = SlippageEstimator(
             base_slippage_pct=config.slippage_pct,
@@ -279,7 +283,8 @@ class LokyBot:
         self._indicators.update(candle)
         self._candle_count += 1
         self._last_price = candle.close
-        self._vol_engine.update()  # aggiorna volatility regime
+        self._vol_engine.update()   # aggiorna volatility regime
+        self._orderflow.update(candle)  # aggiorna order flow
 
         # Registra ATR per leva dinamica
         if self._portfolio_risk is not None:
@@ -440,6 +445,13 @@ class LokyBot:
         vol_mod = self._vol_engine.score_modifier()
         if vol_mod != Decimal('1'):
             best.score = min(best.score * vol_mod, Decimal('100')).quantize(Decimal('0.1'))
+
+        # Order flow modifier: CVD conferma/contraddice il segnale
+        is_long = best.signal_type == SignalType.LONG
+        of_mod = self._orderflow.score_modifier(is_long)
+        if of_mod != Decimal('1'):
+            best.score = min(best.score * of_mod, Decimal('100')).quantize(Decimal('0.1'))
+            best.size = (best.size * of_mod).quantize(Decimal('0.001'))
 
         # --- Filtro sentiment (OI + L/S ratio) ---
         # 1. Blocco esplicito basato su flag block_long/block_short (contrarian estremo)

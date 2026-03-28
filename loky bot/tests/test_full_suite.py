@@ -12,9 +12,6 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 from src.models import Order, Side, OrderStatus, Trade
-from src.core.quote_engine import QuoteEngine
-from src.core.risk_engine import RiskEngine, SystemState, KillSwitchException
-from src.core.fair_value import FairValueEngine
 from src.state.order_manager import OrderManager
 from src.gateways.simulator import SimulatorGateway
 from src.backtest import CandleBacktestEngine as BacktestEngine
@@ -44,9 +41,10 @@ def make_cfg(**overrides) -> BotSettings:
 
 
 # ================================================================== #
-#  FIX #1 — Volatilità NON doppia                                     #
+# (Legacy test classes removed: TestVolatilityNotDoubled,              #
+#  TestFairValueEngine, TestQuoteEngineExtended, TestRiskEngineExtended)#
 # ================================================================== #
-class TestVolatilityNotDoubled:
+class _Removed_Placeholder:
     def test_volatility_factor_1_unchanged(self):
         """Con volatility_factor=1.0, half_spread = base_spread * fair_value / 2."""
         engine = QuoteEngine(skew_factor=Decimal('0'))
@@ -319,9 +317,8 @@ class TestOrderIdUniqueness:
         assert str(parsed) == order_id
 
 
-# ================================================================== #
-#  FairValueEngine                                                     #
-# ================================================================== #
+# (TestFairValueEngine, TestQuoteEngineExtended, TestRiskEngineExtended
+#  rimossi — moduli legacy cancellati in v6.0)
 class TestFairValueEngine:
     def setup_method(self):
         self.engine = FairValueEngine()

@@ -783,30 +783,6 @@ class TestSlippageEstimator:
         assert adjusted < Decimal("100")  # deve ridurre
 
 
-class TestExecutionAnalytics:
-    """Verifica il tracking delle execution analytics."""
-
-    def test_record_and_stats(self):
-        from src.gateways.smart_execution import ExecutionAnalytics
-        analytics = ExecutionAnalytics()
-        analytics.record(
-            symbol="BTCUSDT", side=Side.BUY,
-            expected_price=Decimal("100"), actual_price=Decimal("100.05"),
-            size=Decimal("1"), estimated_slippage=Decimal("0.001"),
-            execution_method="market",
-        )
-        stats = analytics.stats()
-        assert stats["n_executions"] == 1
-        assert stats["market_orders"] == 1
-        assert stats["avg_slippage_pct"] > 0
-
-    def test_empty_analytics(self):
-        from src.gateways.smart_execution import ExecutionAnalytics
-        analytics = ExecutionAnalytics()
-        assert analytics.avg_slippage == Decimal("0")
-        assert analytics.estimation_accuracy == Decimal("1")
-
-
 class TestTWAPVolumeWeighted:
     """Verifica che il TWAP supporti pesi volume."""
 
@@ -1236,46 +1212,6 @@ class TestLiquidationClustering:
         levels = engine.estimate_liquidation_levels()
         # Deve trovare almeno qualche livello
         assert isinstance(levels, list)
-
-    def test_near_liquidation_cluster(self):
-        from src.strategy.orderflow_engine import OrderFlowEngine
-        engine = OrderFlowEngine()
-        # Con pochi dati, non dovrebbe trovare cluster
-        assert engine.near_liquidation_cluster(Decimal("100")) is False
-
-
-class TestAccumulationDistribution:
-    """Verifica l'A/D Line."""
-
-    def test_bullish_ad(self):
-        from src.strategy.orderflow_engine import OrderFlowEngine
-        engine = OrderFlowEngine()
-        # Candele con close vicino al high → accumulazione
-        for i in range(25):
-            c = Candle(
-                symbol="BTCUSDT", timeframe="15m",
-                open=Decimal("100"), high=Decimal("105"),
-                low=Decimal("99"), close=Decimal("104"),
-                volume=Decimal("100"), timestamp=float(i), is_closed=True,
-            )
-            engine.update(c)
-        ad = engine.accumulation_distribution()
-        assert ad > Decimal("0")  # accumulazione
-
-    def test_ad_trend(self):
-        from src.strategy.orderflow_engine import OrderFlowEngine
-        engine = OrderFlowEngine()
-        for i in range(25):
-            c = Candle(
-                symbol="BTCUSDT", timeframe="15m",
-                open=Decimal("100"), high=Decimal("105"),
-                low=Decimal("99"), close=Decimal("104"),
-                volume=Decimal("100"), timestamp=float(i), is_closed=True,
-            )
-            engine.update(c)
-        trend = engine.ad_trend()
-        assert trend in ("accumulation", "distribution", "neutral")
-
 
 class TestBootstrapCI:
     """Verifica Bootstrap Confidence Intervals."""

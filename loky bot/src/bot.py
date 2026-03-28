@@ -43,7 +43,7 @@ from src.strategy.funding_rate_engine import FundingRateEngine
 from src.strategy.indicator_engine import IndicatorEngine
 from src.strategy.market_sentiment_engine import MarketSentimentEngine
 from src.strategy.mean_reversion_engine import MeanReversionEngine
-from src.gateways.smart_execution import ExecutionAnalytics, SlippageEstimator
+from src.gateways.smart_execution import SlippageEstimator
 from src.strategy.orderflow_engine import OrderFlowEngine
 from src.strategy.signal_aggregator import SignalAggregator
 from src.strategy.volatility_engine import VolatilityRegime, VolatilityRegimeEngine
@@ -187,8 +187,6 @@ class LokyBot:
         self._slippage_est = SlippageEstimator(
             base_slippage_pct=config.slippage_pct,
         )
-        self._exec_analytics = ExecutionAnalytics()
-
         # --- Kelly Criterion sizing ---
         self._kelly = KellySizer(
             history_trades = config.kelly_min_trades,
@@ -494,6 +492,9 @@ class LokyBot:
         if best is None:
             return
 
+        # Traccia size originale per cap sui modifiers cumulativi
+        _pre_modifier_size = best.size
+
         # Volatility regime modifier: penalizza in CONTRACTION, premia in COMPRESSION
         vol_mod = self._vol_engine.score_modifier()
         if vol_mod != Decimal('1'):
@@ -560,6 +561,16 @@ class LokyBot:
 
         # --- Anti-martingale: aggiusta size in base al streak ---
         best.size = self._apply_streak_sizing(best.size)
+
+        # Cap cumulative modifiers: size non può scendere sotto 40% dell'originale
+        # Evita che vol_mod × of_mod × sentiment × streak riducano a 0.31× (over-penalizzazione)
+        min_size = (_pre_modifier_size * Decimal('0.40')).quantize(Decimal('0.001'))
+        if best.size < min_size and min_size > _ZERO:
+            logger.debug(
+                "%s Modifier cap: size %.3f → %.3f (40%% floor di %.3f)",
+                self.symbol, best.size, min_size, _pre_modifier_size,
+            )
+            best.size = min_size
 
         if _prom:
             _signals_total.labels(symbol=self.symbol, direction=best.signal_type.name).inc()

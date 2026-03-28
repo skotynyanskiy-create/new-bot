@@ -13,10 +13,17 @@ from typing import Optional
 from src.models import Candle
 
 
-_ZERO    = Decimal('0')
-_ONE     = Decimal('1')
-_TWO     = Decimal('2')
-_HUNDRED = Decimal('100')
+_ZERO       = Decimal('0')
+_ONE        = Decimal('1')
+_TWO        = Decimal('2')
+_THREE      = Decimal(3)
+_NINE       = Decimal(9)
+_TWELVE     = Decimal(12)
+_TWENTY_SIX = Decimal(26)
+_FIFTY      = Decimal(50)
+_HUNDRED    = Decimal(100)
+_PREC_2     = Decimal('0.01')
+_KELTNER_M  = Decimal('1.5')
 
 # Periodi EMA Ribbon fissi
 _RIBBON_PERIODS = (8, 13, 21, 34, 55)
@@ -114,9 +121,9 @@ class IndicatorEngine:
         self._macd_signal: Optional[Decimal] = None
         self._macd_val: Optional[Decimal] = None
         self._macd_hist: Optional[Decimal] = None
-        self._k12 = _TWO / (Decimal('12') + _ONE)
-        self._k26 = _TWO / (Decimal('26') + _ONE)
-        self._k9  = _TWO / (Decimal('9') + _ONE)
+        self._k12 = _TWO / (_TWELVE + _ONE)
+        self._k26 = _TWO / (_TWENTY_SIX + _ONE)
+        self._k9  = _TWO / (_NINE + _ONE)
         self._hist_peaks: deque[Decimal] = deque(maxlen=5)
         self._hist_valleys: deque[Decimal] = deque(maxlen=5)
         self._price_at_hist_peak: deque[Decimal] = deque(maxlen=5)
@@ -196,10 +203,10 @@ class IndicatorEngine:
         if self._avg_gain is None or self._avg_loss is None:
             raise ValueError("RSI non ancora disponibile")
         if self._avg_loss == _ZERO:
-            return Decimal('100')
+            return _HUNDRED
         rs = self._avg_gain / self._avg_loss
-        return (Decimal('100') - (Decimal('100') / (_ONE + rs))).quantize(
-            Decimal('0.01'), rounding=ROUND_HALF_UP
+        return (_HUNDRED - (_HUNDRED / (_ONE + rs))).quantize(
+            _PREC_2, rounding=ROUND_HALF_UP
         )
 
     def atr(self) -> Decimal:
@@ -312,13 +319,13 @@ class IndicatorEngine:
     # Keltner Channel & Squeeze
     # ------------------------------------------------------------------
 
-    def keltner_upper(self, mult: Decimal = Decimal('1.5')) -> Decimal:
+    def keltner_upper(self, mult: Decimal = _KELTNER_M) -> Decimal:
         """Keltner upper = EMA20 + mult × ATR."""
         ema = self.bb_middle()  # EMA20 (stessa base delle BB)
         atr = self.atr()
         return ema + mult * atr
 
-    def keltner_lower(self, mult: Decimal = Decimal('1.5')) -> Decimal:
+    def keltner_lower(self, mult: Decimal = _KELTNER_M) -> Decimal:
         """Keltner lower = EMA20 - mult × ATR."""
         ema = self.bb_middle()
         atr = self.atr()
@@ -512,14 +519,14 @@ class IndicatorEngine:
                 self._dx_values.clear()  # reset per uso DX
                 # Prima DI+/DI-
                 if self._adx_tr_smooth > _ZERO:
-                    self._di_plus_val  = (self._adx_dm_plus_s  / self._adx_tr_smooth * Decimal('100')).quantize(Decimal('0.01'))
-                    self._di_minus_val = (self._adx_dm_minus_s / self._adx_tr_smooth * Decimal('100')).quantize(Decimal('0.01'))
+                    self._di_plus_val  = (self._adx_dm_plus_s  / self._adx_tr_smooth * _HUNDRED).quantize(_PREC_2)
+                    self._di_minus_val = (self._adx_dm_minus_s / self._adx_tr_smooth * _HUNDRED).quantize(_PREC_2)
                 else:
                     self._di_plus_val  = _ZERO
                     self._di_minus_val = _ZERO
                 # Prima DX → feed per ADX seed
                 di_sum  = self._di_plus_val + self._di_minus_val
-                dx = (abs(self._di_plus_val - self._di_minus_val) / di_sum * Decimal('100')) if di_sum != _ZERO else _ZERO
+                dx = (abs(self._di_plus_val - self._di_minus_val) / di_sum * _HUNDRED) if di_sum != _ZERO else _ZERO
                 self._dx_values.append(dx)
         else:
             # Wilder smoothing: smooth = smooth - smooth/period + current
@@ -528,14 +535,14 @@ class IndicatorEngine:
             self._adx_dm_minus_s = self._adx_dm_minus_s - self._adx_dm_minus_s / period + dm_minus
 
             if self._adx_tr_smooth > _ZERO:
-                self._di_plus_val  = (self._adx_dm_plus_s  / self._adx_tr_smooth * Decimal('100')).quantize(Decimal('0.01'))
-                self._di_minus_val = (self._adx_dm_minus_s / self._adx_tr_smooth * Decimal('100')).quantize(Decimal('0.01'))
+                self._di_plus_val  = (self._adx_dm_plus_s  / self._adx_tr_smooth * _HUNDRED).quantize(_PREC_2)
+                self._di_minus_val = (self._adx_dm_minus_s / self._adx_tr_smooth * _HUNDRED).quantize(_PREC_2)
             else:
                 self._di_plus_val  = _ZERO
                 self._di_minus_val = _ZERO
 
             di_sum = self._di_plus_val + self._di_minus_val
-            dx = (abs(self._di_plus_val - self._di_minus_val) / di_sum * Decimal('100')) if di_sum != _ZERO else _ZERO
+            dx = (abs(self._di_plus_val - self._di_minus_val) / di_sum * _HUNDRED) if di_sum != _ZERO else _ZERO
             self._dx_values.append(dx)
 
             if self._adx_val is None:
@@ -545,7 +552,7 @@ class IndicatorEngine:
             else:
                 # Wilder smoothing ADX
                 self._adx_val = (self._adx_val * (period - _ONE) + dx) / period
-                self._adx_val = self._adx_val.quantize(Decimal('0.01'))
+                self._adx_val = self._adx_val.quantize(_PREC_2)
 
     # ------------------------------------------------------------------
     # Metodi privati di calcolo — Bollinger Bands
@@ -624,7 +631,7 @@ class IndicatorEngine:
                 start = max(0, len(self._candles) - 12)
                 self._ema12 = sum(
                     c.close for c in itertools.islice(self._candles, start, len(self._candles))
-                ) / Decimal('12')
+                ) / _TWELVE
         else:
             self._ema12 = (price - self._ema12) * self._k12 + self._ema12
         # EMA26
@@ -633,7 +640,7 @@ class IndicatorEngine:
                 start = max(0, len(self._candles) - 26)
                 self._ema26 = sum(
                     c.close for c in itertools.islice(self._candles, start, len(self._candles))
-                ) / Decimal('26')
+                ) / _TWENTY_SIX
         else:
             self._ema26 = (price - self._ema26) * self._k26 + self._ema26
         # MACD line
@@ -705,7 +712,7 @@ class IndicatorEngine:
         rsi_max = max(self._rsi_history)
         rsi_range = rsi_max - rsi_min
         if rsi_range <= _ZERO:
-            self._stoch_rsi_val = Decimal('50')
+            self._stoch_rsi_val = _FIFTY
         else:
             self._stoch_rsi_val = ((current_rsi - rsi_min) / rsi_range) * _HUNDRED
         # K% = 3-SMA of StochRSI
@@ -737,14 +744,14 @@ class IndicatorEngine:
         if len(self._stoch_k_vals) < 3:
             return False
         vals = list(self._stoch_k_vals)
-        return vals[-2] < Decimal('20') and vals[-1] > vals[-2]
+        return vals[-2] < Decimal(20) and vals[-1] > vals[-2]
 
     def stoch_overbought_drop(self) -> bool:
         """True se K% scende da zona ipercomprata (>80) verso il basso."""
         if len(self._stoch_k_vals) < 3:
             return False
         vals = list(self._stoch_k_vals)
-        return vals[-2] > Decimal('80') and vals[-1] < vals[-2]
+        return vals[-2] > Decimal(80) and vals[-1] < vals[-2]
 
     # ------------------------------------------------------------------
     # Metodi privati di calcolo — VWAP intraday
@@ -861,7 +868,7 @@ class IndicatorEngine:
         self._vwap_date = candle_date
 
         # Typical price = (H + L + C) / 3
-        typical = (candle.high + candle.low + candle.close) / Decimal('3')
+        typical = (candle.high + candle.low + candle.close) / _THREE
         self._vwap_cum_pv  += typical * candle.volume
         self._vwap_cum_vol += candle.volume
 

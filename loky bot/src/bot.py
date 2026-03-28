@@ -397,67 +397,9 @@ class LokyBot:
         if self._state != BotState.FLAT:
             return
 
-        # Blocco crisis mode: orchestratore ha rilevato crash BTC
-        if self._crisis_block_entry:
+        # All entry pre-checks (extracted for clarity)
+        if not self._check_entry_allowed(candle):
             return
-
-        # Blocco esplicito regime CHOPPY: nessun trade ammesso (ADX < 15)
-        if self._aggregator.is_choppy_market():
-            return
-
-        # Cooldown post-loss
-        if self._cooldown_remaining > 0:
-            self._cooldown_remaining -= 1
-            logger.debug("%s Cooldown: %d candele rimaste.", self.symbol, self._cooldown_remaining)
-            return
-
-        # Circuit breaker: pausa dopo N perdite consecutive
-        if self._circuit_breaker_candles > 0:
-            self._circuit_breaker_candles -= 1
-            if self._circuit_breaker_candles == 0:
-                logger.info(
-                    "%s Circuit breaker SCADUTO — trading ripreso.",
-                    self.symbol,
-                )
-                if self._notifier:
-                    self._fire_and_forget(self._notifier.info(
-                        f"✅ Circuit breaker {self.symbol} scaduto — trading ripreso."
-                    ))
-            else:
-                logger.debug(
-                    "%s Circuit breaker attivo: %d candle rimaste.",
-                    self.symbol, self._circuit_breaker_candles,
-                )
-            return
-
-        if self._is_daily_stop_active():
-            return
-
-        # --- Time-of-day filter: evita orari a bassa liquidità ---
-        utc_hour = datetime.datetime.utcnow().hour
-        # Evita trading tra 21-23 UTC (bassa liquidità, spread alti)
-        # e tra 4-5 UTC (gap di liquidità Asia → Europa)
-        if utc_hour in (21, 22, 23, 4):
-            logger.debug("%s Skip segnali: ora UTC %d (bassa liquidità)", self.symbol, utc_hour)
-            return
-
-        # --- Volatility regime filter: blocca entry in squeeze/gap ---
-        vol_regime = self._vol_engine.detect()
-        self._current_vol_regime = vol_regime  # cache per uso downstream
-        # Gap protection pre-entry: se l'ultima candle ha un gap > 2×ATR, skip
-        if len(self._candles) >= 2:
-            try:
-                atr = self._indicators.atr()
-                prev_close = self._candles[-2].close
-                gap = abs(candle.open - prev_close)
-                if gap > atr * Decimal('2'):
-                    logger.info(
-                        "%s Gap %.4f > 2×ATR — skip segnali (rischio slippage).",
-                        self.symbol, gap,
-                    )
-                    return
-            except ValueError:
-                pass
 
         # --- Detect regime e raccoglie segnali ---
         signals = self._collect_signals()
@@ -492,85 +434,9 @@ class LokyBot:
         if best is None:
             return
 
-        # Traccia size originale per cap sui modifiers cumulativi
-        _pre_modifier_size = best.size
-
-        # Volatility regime modifier: penalizza in CONTRACTION, premia in COMPRESSION
-        vol_mod = self._vol_engine.score_modifier()
-        if vol_mod != Decimal('1'):
-            best.score = min(best.score * vol_mod, Decimal('100')).quantize(Decimal('0.1'))
-
-        # Order flow modifier: CVD conferma/contraddice il segnale
-        is_long = best.signal_type == SignalType.LONG
-        of_mod = self._orderflow.score_modifier(is_long)
-        if of_mod != Decimal('1'):
-            best.score = min(best.score * of_mod, Decimal('100')).quantize(Decimal('0.1'))
-            best.size = (best.size * of_mod).quantize(Decimal('0.001'))
-
-        # --- Filtro sentiment (OI + L/S ratio) ---
-        # 1. Blocco esplicito basato su flag block_long/block_short (contrarian estremo)
-        if self._sentiment.is_blocked(self.symbol, best.signal_type):
-            logger.info(
-                "%s Segnale %s bloccato da sentiment (retail overextended).",
-                self.symbol, best.signal_type.name,
-            )
+        # Apply score/size modifiers + filters (extracted for clarity)
+        if not self._apply_signal_modifiers(best):
             return
-        # 2. Aggiustamento score basato su OI delta e ratio (±15 punti)
-        sent_adj = self._sentiment.score_adjustment_for(self.symbol, best.signal_type)
-        if sent_adj != 0:
-            old_score = best.score
-            best.score = max(_ZERO, best.score + Decimal(str(sent_adj)))
-            logger.debug(
-                "%s Sentiment adjustment: %+d punti (%s) score %.0f→%.0f",
-                self.symbol, sent_adj, best.signal_type.name, old_score, best.score,
-            )
-        # 3. Sizing basato su sentiment: OI in linea con la direzione → size boost
-        if sent_adj > 10:
-            best.size = (best.size * Decimal('1.2')).quantize(Decimal('0.001'))
-            logger.debug("%s Sentiment boost: size +20%% (forte allineamento OI)", self.symbol)
-        elif sent_adj < -5:
-            best.size = (best.size * Decimal('0.7')).quantize(Decimal('0.001'))
-            logger.debug("%s Sentiment cautela: size -30%% (OI contrario)", self.symbol)
-
-        # --- Filtro macro trend (4h) ---
-        if not self._macro_trend_aligned(best.signal_type):
-            logger.debug(
-                "%s Segnale %s (%s) scartato: trend 4h non allineato.",
-                self.symbol, best.signal_type.name, best.strategy_name,
-            )
-            return
-
-        # --- Filtro multi-timeframe (1h) ---
-        if not self._htf_trend_aligned(best.signal_type):
-            logger.debug(
-                "%s Segnale %s (%s) scartato: trend 1h non allineato.",
-                self.symbol, best.signal_type.name, best.strategy_name,
-            )
-            return
-
-        # Score minimo dopo tutti gli aggiustamenti
-        if best.score < self._cfg.strategy.min_signal_score:
-            logger.debug(
-                "%s Segnale %s score insufficiente post-sentiment: %.0f < %.0f",
-                self.symbol, best.signal_type.name, best.score, self._cfg.strategy.min_signal_score,
-            )
-            return
-
-        # Portfolio risk check spostato in _enter_position (DOPO Kelly/leverage adjustments)
-        # per verificare il notional EFFETTIVO, non quello pre-adjustment
-
-        # --- Anti-martingale: aggiusta size in base al streak ---
-        best.size = self._apply_streak_sizing(best.size)
-
-        # Cap cumulative modifiers: size non può scendere sotto 40% dell'originale
-        # Evita che vol_mod × of_mod × sentiment × streak riducano a 0.31× (over-penalizzazione)
-        min_size = (_pre_modifier_size * Decimal('0.40')).quantize(Decimal('0.001'))
-        if best.size < min_size and min_size > _ZERO:
-            logger.debug(
-                "%s Modifier cap: size %.3f → %.3f (40%% floor di %.3f)",
-                self.symbol, best.size, min_size, _pre_modifier_size,
-            )
-            best.size = min_size
 
         if _prom:
             _signals_total.labels(symbol=self.symbol, direction=best.signal_type.name).inc()
@@ -584,6 +450,112 @@ class LokyBot:
             self._pending_signal = best
         else:
             await self._enter_position(best)
+
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Score/Size Modifiers + Trend Filters (extracted from on_candle)
+    # ------------------------------------------------------------------
+
+    def _check_entry_allowed(self, candle: Candle) -> bool:
+        """
+        Verifica tutte le pre-condizioni per generare segnali di entry.
+        Returns True se il bot può cercare segnali, False se bloccato.
+        Gestisce: crisis mode, CHOPPY, cooldown, circuit breaker, daily stop,
+        time-of-day, volatility regime, gap protection.
+        """
+        if self._crisis_block_entry:
+            return False
+        if self._aggregator.is_choppy_market():
+            return False
+
+        if self._cooldown_remaining > 0:
+            self._cooldown_remaining -= 1
+            return False
+
+        if self._circuit_breaker_candles > 0:
+            self._circuit_breaker_candles -= 1
+            if self._circuit_breaker_candles == 0:
+                logger.info("%s Circuit breaker SCADUTO — trading ripreso.", self.symbol)
+                if self._notifier:
+                    self._fire_and_forget(self._notifier.info(
+                        f"✅ Circuit breaker {self.symbol} scaduto — trading ripreso."
+                    ))
+            return False
+
+        if self._is_daily_stop_active():
+            return False
+
+        utc_hour = datetime.datetime.utcnow().hour
+        if utc_hour in (21, 22, 23, 4):
+            return False
+
+        # Volatility regime + gap protection
+        vol_regime = self._vol_engine.detect()
+        self._current_vol_regime = vol_regime
+        if len(self._candles) >= 2:
+            try:
+                atr = self._indicators.atr()
+                prev_close = self._candles[-2].close
+                gap = abs(candle.open - prev_close)
+                if gap > atr * Decimal('2'):
+                    return False
+            except ValueError:
+                pass
+
+        return True
+
+    def _apply_signal_modifiers(self, best: Signal) -> bool:
+        """
+        Applica tutti i modifier a score e size del segnale selezionato.
+        Verifica trend filters (macro + HTF) e score minimo.
+
+        Returns True se il segnale è valido per l'entry, False se scartato.
+        """
+        pre_size = best.size
+
+        # --- Score modifiers ---
+        vol_mod = self._vol_engine.score_modifier()
+        if vol_mod != Decimal('1'):
+            best.score = min(best.score * vol_mod, Decimal('100')).quantize(Decimal('0.1'))
+
+        is_long = best.signal_type == SignalType.LONG
+        of_mod = self._orderflow.score_modifier(is_long)
+        if of_mod != Decimal('1'):
+            best.score = min(best.score * of_mod, Decimal('100')).quantize(Decimal('0.1'))
+            best.size = (best.size * of_mod).quantize(Decimal('0.001'))
+
+        # --- Sentiment ---
+        if self._sentiment.is_blocked(self.symbol, best.signal_type):
+            logger.info("%s Segnale %s bloccato da sentiment.", self.symbol, best.signal_type.name)
+            return False
+
+        sent_adj = self._sentiment.score_adjustment_for(self.symbol, best.signal_type)
+        if sent_adj != 0:
+            best.score = max(_ZERO, best.score + Decimal(str(sent_adj)))
+        if sent_adj > 10:
+            best.size = (best.size * Decimal('1.2')).quantize(Decimal('0.001'))
+        elif sent_adj < -5:
+            best.size = (best.size * Decimal('0.7')).quantize(Decimal('0.001'))
+
+        # --- Trend filters ---
+        if not self._macro_trend_aligned(best.signal_type):
+            return False
+        if not self._htf_trend_aligned(best.signal_type):
+            return False
+
+        # --- Score minimo ---
+        if best.score < self._cfg.strategy.min_signal_score:
+            return False
+
+        # --- Size modifiers ---
+        best.size = self._apply_streak_sizing(best.size)
+
+        # Cap cumulative modifiers a 40% dell'originale
+        min_size = (pre_size * Decimal('0.40')).quantize(Decimal('0.001'))
+        if best.size < min_size and min_size > _ZERO:
+            best.size = min_size
+
+        return True
 
     # ------------------------------------------------------------------
     # Raccolta segnali da tutti gli engine

@@ -88,6 +88,17 @@ class BreakoutEngine:
 
         volume_ok = self._volume_ok(candle, vol_ma)
 
+        # Multi-candle level validation: il HH/LL deve essere stato testato
+        # da almeno 2 candle per essere un livello reale (evita spike singoli)
+        lookback = self._cfg.breakout_lookback
+        if len(candles) >= lookback:
+            recent = list(candles)[-lookback:]
+            hh_touches = sum(1 for c in recent if c.high >= hh * Decimal('0.998'))
+            ll_touches = sum(1 for c in recent if c.low <= ll * Decimal('1.002'))
+        else:
+            hh_touches = 1
+            ll_touches = 1
+
         # VWAP filter: LONG solo se prezzo > VWAP (bullish volume bias)
         vwap_long_ok  = self._indicators.price_above_vwap(candle.close)
         vwap_short_ok = self._indicators.price_below_vwap(candle.close)
@@ -99,6 +110,7 @@ class BreakoutEngine:
             candle.close > hh
             and is_bullish
             and volume_ok
+            and hh_touches >= 2   # livello testato da almeno 2 candle
             and self._cfg.rsi_min <= rsi_val <= self._cfg.rsi_max
             and ema_fast > ema_slow
             and vwap_long_ok
@@ -144,6 +156,7 @@ class BreakoutEngine:
             candle.close < ll
             and is_bearish
             and volume_ok
+            and ll_touches >= 2   # livello testato da almeno 2 candle
             and rsi_short_ok
             and ema_fast < ema_slow
             and vwap_short_ok

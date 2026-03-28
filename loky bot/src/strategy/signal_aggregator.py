@@ -118,61 +118,59 @@ class SignalAggregator:
 
     def score(self, signal: Signal) -> Decimal:
         """
-        Calcola score 0-100 per il segnale dato.
-        Il segnale ha già uno score base impostato dall'engine.
-        Qui applichiamo bonus/penalità contestuali.
+        Scoring 0-100 con approccio confluence-first.
+
+        Pesi (rivisti per massima profittabilità):
+          Trend strength (ADX)    : 25%  — trend forti hanno momentum
+          HTF alignment (1h)      : 25%  — previene whipsaw
+          Confluence TF (4h)      : 20%  — triple TF = segnale istituzionale
+          Volume confirmation     : 15%  — valida il movimento
+          Strategy weight         : 15%  — premia strategie vincenti
+
+        Il base score dell'engine vale come floor (non viene ignorato).
         """
+        import math
+
         if signal.signal_type == SignalType.NONE:
             return _ZERO
 
-        base = signal.score  # score impostato dall'engine (es. 65, 72, 80)
+        base = signal.score  # score dall'engine (65, 72, 80)
 
-        # Bonus ADX strength
+        # --- 1. Trend Strength (25%) ---
+        # ADX normalizzato su range 0-60 (più realistico di 0-50)
         try:
             adx_val = self._ind.adx()
-            adx_normalized = min(adx_val / Decimal('50'), _ONE) * Decimal('10')
+            trend_score = min(adx_val / Decimal('60'), _ONE) * Decimal('25')
         except ValueError:
-            adx_normalized = _ZERO
+            trend_score = Decimal('12')  # neutro
 
-        # Bonus volume: scala logaritmica continua (non step discreti)
-        # log2(vol_ratio) × 4, capped [-4, +10]
-        # 0.5x → -4, 1.0x → 0, 1.5x → +2.3, 2.0x → +4, 3.0x → +6.3, 4.0x → +8
-        try:
-            vol_ratio = self._ind.volume_ratio()
-            if vol_ratio > _ZERO:
-                import math
-                log_vol = Decimal(str(math.log2(max(float(vol_ratio), 0.25))))
-                vol_bonus = max(Decimal('-4'), min(log_vol * Decimal('4'), Decimal('10')))
-            else:
-                vol_bonus = Decimal('-4')
-        except (ValueError, OverflowError):
-            vol_bonus = _ZERO
-
-        # HTF alignment: gradiente basato su distanza EMA (non binario)
-        # Misura quanto forte è l'allineamento HTF: da -8 (forte contrario) a +10 (forte allineato)
-        htf_bonus = _ZERO
+        # --- 2. HTF Alignment (25%) ---
+        # Gradiente: forte allineamento = 25pt, forte contrario = -15pt
+        htf_score = _ZERO
+        htf_aligned = False
         if self._htf_ind is not None:
             try:
                 htf_fast = self._htf_ind.ema_fast()
                 htf_slow = self._htf_ind.ema_slow()
                 if htf_slow > _ZERO:
-                    # Distanza normalizzata EMA fast vs slow (% del prezzo)
                     ema_spread = (htf_fast - htf_slow) / htf_slow
-                    # Per LONG: spread positivo = allineato, negativo = contrario
-                    # Per SHORT: invertito
                     if signal.signal_type == SignalType.SHORT:
                         ema_spread = -ema_spread
-                    # Scala: 0.5% spread → +5, 1% → +8, 2%+ → +10, -0.5% → -5
-                    htf_bonus = min(ema_spread * Decimal('1000'), Decimal('10'))
-                    htf_bonus = max(htf_bonus, Decimal('-8'))
+                    # Allineato: 0 a +25, Contrario: 0 a -15
+                    if ema_spread > _ZERO:
+                        htf_score = min(ema_spread * Decimal('2500'), Decimal('25'))
+                        htf_aligned = True
+                    else:
+                        htf_score = max(ema_spread * Decimal('1500'), Decimal('-15'))
             except ValueError:
                 pass
 
-        # Multi-Timeframe Confluence: bonus se macro (4h) è allineato
-        macro_bonus = _ZERO
-        tf_aligned = 1  # primary TF è sempre "allineato" (ha generato il segnale)
-        if htf_bonus > _ZERO:
-            tf_aligned += 1  # HTF (1h) allineato
+        # --- 3. Confluence TF (20%) ---
+        # Macro (4h) allineamento + conteggio TF
+        tf_aligned = 1  # primary sempre allineato
+        if htf_aligned:
+            tf_aligned += 1
+        macro_aligned = False
         if self._macro_ind is not None:
             try:
                 macro_fast = self._macro_ind.ema_fast()
@@ -181,26 +179,45 @@ class SignalAggregator:
                     macro_spread = (macro_fast - macro_slow) / macro_slow
                     if signal.signal_type == SignalType.SHORT:
                         macro_spread = -macro_spread
-                    if macro_spread > Decimal('0.001'):  # >0.1% = allineato
-                        macro_bonus = Decimal('5')
+                    if macro_spread > Decimal('0.001'):
                         tf_aligned += 1
-                    elif macro_spread < Decimal('-0.001'):  # contrario
-                        macro_bonus = Decimal('-5')
+                        macro_aligned = True
             except ValueError:
                 pass
 
-        # Confluence multiplier: 3 TF allineati → bonus extra
-        confluence_bonus = _ZERO
+        # Confluence scaling: 3TF=20pt, 2TF=12pt, 1TF=4pt (penalità forte)
         if tf_aligned >= 3:
-            confluence_bonus = Decimal('5')  # triple confluence bonus
-        elif tf_aligned < 2:
-            confluence_bonus = Decimal('-3')  # solo 1 TF: penalità
+            confluence_score = Decimal('20')
+        elif tf_aligned == 2:
+            confluence_score = Decimal('12')
+        else:
+            confluence_score = Decimal('4')
 
-        # Adaptive strategy weight: penalizza/premia in base a performance storica
+        # --- 4. Volume Confirmation (15%) ---
+        # Percentile-based: volume rank nella rolling window
+        try:
+            vol_ratio = self._ind.volume_ratio()
+            if vol_ratio > _ZERO:
+                log_vol = Decimal(str(math.log2(max(float(vol_ratio), 0.25))))
+                vol_score = max(Decimal('0'), min((log_vol + Decimal('1')) * Decimal('7.5'), Decimal('15')))
+            else:
+                vol_score = _ZERO
+        except (ValueError, OverflowError):
+            vol_score = Decimal('7')  # neutro
+
+        # --- 5. Strategy Weight (15%) ---
         strat_weight = self.strategy_weight(signal.strategy_name)
-        raw_score = base + adx_normalized + vol_bonus + htf_bonus + macro_bonus + confluence_bonus
-        final_score = min(raw_score * strat_weight, _HUNDRED)
-        return max(_ZERO, final_score).quantize(Decimal('0.1'))
+        # Converti peso (0.6-1.2) in punti (0-15)
+        strat_score = min((strat_weight - Decimal('0.5')) * Decimal('21.4'), Decimal('15'))
+        strat_score = max(_ZERO, strat_score)
+
+        # Score contestuale (0-100)
+        context_score = trend_score + htf_score + confluence_score + vol_score + strat_score
+
+        # Blend: 60% engine base + 40% contesto (evita che il contesto sovrascriva un buon segnale)
+        blended = base * Decimal('0.6') + context_score * Decimal('0.4')
+        final_score = max(_ZERO, min(blended, _HUNDRED))
+        return final_score.quantize(Decimal('0.1'))
 
     # ------------------------------------------------------------------
     # Selezione migliore

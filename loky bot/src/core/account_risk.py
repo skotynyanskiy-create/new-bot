@@ -209,15 +209,17 @@ class AccountRiskManager:
     def _maybe_reset_daily(self) -> None:
         now_day = self._today_start()
         if now_day > self._day_start:
+            # Carry-over: se ci sono posizioni aperte con PnL non realizzato negativo,
+            # lo portiamo al giorno nuovo per evitare che una posizione cross-midnight
+            # resetti artificialmente il contatore daily.
+            carry_over = min(_ZERO, self._unrealized_pnl)
             logger.info(
-                "Reset daily PnL (era %.4f USDT). Nuovo giorno UTC.",
-                self._realized_pnl_day,
+                "Reset daily PnL (era %.4f USDT, carry-over unrealized: %.4f). Nuovo giorno UTC.",
+                self._realized_pnl_day, carry_over,
             )
-            self._realized_pnl_day = _ZERO
+            self._realized_pnl_day = carry_over  # parte dal negativo se ci sono perdite aperte
             self._stop_triggered   = False
-            # Il peak drawdown stop NON viene resettato giornalmente:
-            # protegge il capitale dall'inizio della sessione, non si azzera mai da solo.
-            # (L'operatore deve riavviare il bot dopo aver valutato la situazione.)
+            # Il peak drawdown stop NON viene resettato giornalmente.
             self._day_start        = now_day
 
     @staticmethod

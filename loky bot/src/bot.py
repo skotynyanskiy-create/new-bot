@@ -385,6 +385,36 @@ class LokyBot:
         if self._is_daily_stop_active():
             return
 
+        # --- Time-of-day filter: evita orari a bassa liquidità ---
+        import datetime
+        utc_hour = datetime.datetime.utcnow().hour
+        # Evita trading tra 21-23 UTC (bassa liquidità, spread alti)
+        # e tra 4-5 UTC (gap di liquidità Asia → Europa)
+        if utc_hour in (21, 22, 23, 4):
+            logger.debug("%s Skip segnali: ora UTC %d (bassa liquidità)", self.symbol, utc_hour)
+            return
+
+        # --- Volatility regime filter: blocca entry in squeeze/gap ---
+        from src.strategy.volatility_engine import VolatilityRegime
+        vol_regime = self._vol_engine.detect()
+        if vol_regime == VolatilityRegime.CONTRACTION:
+            # Trend esaurito: accetta solo TrendFollowing con score alto
+            pass  # filtraggio avviene sotto
+        # Gap protection pre-entry: se l'ultima candle ha un gap > 2×ATR, skip
+        if len(self._candles) >= 2:
+            try:
+                atr = self._indicators.atr()
+                prev_close = self._candles[-2].close
+                gap = abs(candle.open - prev_close)
+                if gap > atr * Decimal('2'):
+                    logger.info(
+                        "%s Gap %.4f > 2×ATR — skip segnali (rischio slippage).",
+                        self.symbol, gap,
+                    )
+                    return
+            except ValueError:
+                pass
+
         # --- Detect regime e raccoglie segnali ---
         signals = self._collect_signals()
 
@@ -428,6 +458,13 @@ class LokyBot:
                 "%s Sentiment adjustment: %+d punti (%s) score %.0f→%.0f",
                 self.symbol, sent_adj, best.signal_type.name, old_score, best.score,
             )
+        # 3. Sizing basato su sentiment: OI in linea con la direzione → size boost
+        if sent_adj > 10:
+            best.size = (best.size * Decimal('1.2')).quantize(Decimal('0.001'))
+            logger.debug("%s Sentiment boost: size +20%% (forte allineamento OI)", self.symbol)
+        elif sent_adj < -5:
+            best.size = (best.size * Decimal('0.7')).quantize(Decimal('0.001'))
+            logger.debug("%s Sentiment cautela: size -30%% (OI contrario)", self.symbol)
 
         # --- Filtro macro trend (4h) ---
         if not self._macro_trend_aligned(best.signal_type):
@@ -599,6 +636,12 @@ class LokyBot:
         if not self._cfg.strategy.trailing_stop_enabled:
             return
         if self._position_side is None or self._position_size == _ZERO:
+            return
+        # Attiva trail solo DOPO almeno 1 partial TP (TP1 50%).
+        # Prima di TP1, lo SL è fisso e il prezzo deve raggiungere il primo target.
+        # Dopo TP1, lo SL è a breakeven e il trail protegge il residuo.
+        tp1_hit = self._tp_levels and self._tp_levels[0].hit
+        if not tp1_hit:
             return
         try:
             atr = self._indicators.atr()
@@ -1499,14 +1542,16 @@ class LokyBot:
             self._entry_price = (
                 (self._entry_price * self._position_size + fill_price * add_size) / total_size
             )
-        self._position_size      += add_size
-        self._position_size_orig += add_size  # estende la size base per Kelly
-        self._scale_in_count     += 1
-        self._scale_in_size      += add_size
+        self._position_size  += add_size
+        # NON aggiornare _position_size_orig: Kelly usa _kelly_risk_size (snapshot pre-scale-in)
+        # per evitare di corrompere il calcolo del risk_amount.
+        self._scale_in_count += 1
+        self._scale_in_size  += add_size
 
-        # Aggiorna portfolio risk con il notional aggiuntivo
+        # Aggiorna portfolio risk: aggiorna il notional in-place (non registrare doppia apertura)
         if self._portfolio_risk is not None:
-            self._portfolio_risk.register_open(self.symbol, fill_price * add_size)
+            current = self._portfolio_risk._open_notional.get(self.symbol, _ZERO)
+            self._portfolio_risk._open_notional[self.symbol] = current + fill_price * add_size
 
         logger.info(
             "%s [Loky] SCALE-IN #%d (%s) | +%.3f @ %.4f | size totale=%.3f | "

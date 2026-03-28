@@ -79,19 +79,50 @@ class OrderManager:
             logger.error(f"Errore cancellazione ordine: {e}")
             order.status = OrderStatus.OPEN # rollback
 
-    async def place_twap_order(self, symbol: str, gateway, side: Side, target_price: Decimal, total_size: Decimal, duration_seconds: int = 60, slices: int = 6):
-        """Esegue un ordine TWAP suddividendo su 'slices' in 'duration_seconds'."""
+    async def place_twap_order(
+        self,
+        symbol: str,
+        gateway,
+        side: Side,
+        target_price: Decimal,
+        total_size: Decimal,
+        duration_seconds: int = 60,
+        slices: int = 6,
+        volume_weights: list[float] | None = None,
+    ):
+        """
+        Esegue un ordine TWAP con ponderazione volume opzionale.
+
+        Args:
+            volume_weights — pesi per ogni slice (normalizzati internamente).
+                             Se None, distribuzione uniforme.
+                             Es. [0.5, 1.0, 1.5, 1.5, 1.0, 0.5] per concentrare
+                             il volume nel mezzo dell'esecuzione.
+        """
         if total_size <= 0 or slices <= 0 or duration_seconds <= 0:
             logger.warning("Parametri TWAP non validi")
             return
 
-        slice_size = (total_size / Decimal(slices)).quantize(Decimal('0.00000001'))
         interval = duration_seconds / slices
 
-        logger.info(f"TWAP: {symbol} {side.name} {total_size} su {duration_seconds}s in {slices} slice da {slice_size}")
+        # Calcola pesi normalizzati
+        if volume_weights and len(volume_weights) == slices:
+            total_weight = sum(volume_weights)
+            weights = [Decimal(str(w / total_weight)) for w in volume_weights]
+        else:
+            weights = [Decimal('1') / Decimal(str(slices))] * slices
+
+        logger.info(
+            "TWAP: %s %s %.6f su %ds in %d slice (volume-weighted=%s)",
+            symbol, side.name, total_size, duration_seconds, slices,
+            volume_weights is not None,
+        )
 
         for i in range(slices):
-            await self._place_order(symbol, gateway, side, target_price, slice_size)
-            await asyncio.sleep(interval)
+            slice_size = (total_size * weights[i]).quantize(Decimal('0.00000001'))
+            if slice_size > 0:
+                await self._place_order(symbol, gateway, side, target_price, slice_size)
+            if i < slices - 1:
+                await asyncio.sleep(interval)
 
-        logger.info(f"TWAP completato: {symbol} {side.name} {total_size}")
+        logger.info("TWAP completato: %s %s %.6f", symbol, side.name, total_size)

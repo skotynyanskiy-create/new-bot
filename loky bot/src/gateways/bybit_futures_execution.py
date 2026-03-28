@@ -91,12 +91,11 @@ class BybitFuturesExecutionGateway(ExecutionGateway):
         self.on_order_update: Optional[Callable] = None
         self._notifier: Optional[Any] = None    # TelegramNotifier opzionale per alert watchdog
 
-        # Token bucket per rate limiting
+        # Rate limiting basato su Semaphore (thread-safe per asyncio).
+        # Ogni token viene rilasciato dopo 1/max_rps secondi, garantendo
+        # che non si superino mai max_rps richieste al secondo.
         self._max_rps        = rate_limit_rps
         self._rate_semaphore = asyncio.Semaphore(rate_limit_rps)
-        self._rate_tokens    = rate_limit_rps
-        self._rate_lock      = asyncio.Lock()
-        self._last_refill    = time.monotonic()
 
     def set_notifier(self, notifier: Any) -> None:
         """Inietta il TelegramNotifier per alert watchdog."""
@@ -132,6 +131,20 @@ class BybitFuturesExecutionGateway(ExecutionGateway):
     ) -> Optional[Order]:
         """Invia ordine MARKET su Bybit Linear Futures."""
         side_str = "Buy" if side == Side.BUY else "Sell"
+        # Pre-registra un ordine placeholder per evitare race condition
+        # tra risposta REST e notifica WebSocket fill.
+        placeholder_id = f"_pending_{symbol}_{int(time.time()*1000)}"
+        placeholder = Order(
+            id=placeholder_id,
+            symbol=symbol,
+            side=side,
+            price=Decimal("0"),
+            size=size,
+            status=OrderStatus.PENDING,
+            filled_size=Decimal("0"),
+        )
+        self._pending_orders[placeholder_id] = placeholder
+
         body = {
             "category":  "linear",
             "symbol":    symbol,
@@ -141,6 +154,9 @@ class BybitFuturesExecutionGateway(ExecutionGateway):
         }
         try:
             resp = await self._signed_post("/v5/order/create", body)
+            # Rimuovi placeholder
+            self._pending_orders.pop(placeholder_id, None)
+
             if resp.get("retCode") != 0:
                 logger.error("Market order rifiutato %s: %s", symbol, resp)
                 return None
@@ -159,6 +175,7 @@ class BybitFuturesExecutionGateway(ExecutionGateway):
             logger.info("Market order inviato: %s %s %s", side_str, size, symbol)
             return order
         except Exception as e:
+            self._pending_orders.pop(placeholder_id, None)
             logger.error("Errore market order %s: %s", symbol, e)
             return None
 
@@ -261,6 +278,11 @@ class BybitFuturesExecutionGateway(ExecutionGateway):
     async def submit_order(self, order: Order) -> None:
         """Invia ordine LIMIT."""
         side_str = "Buy" if order.side == Side.BUY else "Sell"
+        # Pre-registra con ID temporaneo per evitare race condition WS
+        temp_id = order.id
+        order.status = OrderStatus.PENDING
+        self._pending_orders[temp_id] = order
+
         body = {
             "category":    "linear",
             "symbol":      order.symbol,
@@ -272,6 +294,7 @@ class BybitFuturesExecutionGateway(ExecutionGateway):
         }
         try:
             resp = await self._signed_post("/v5/order/create", body)
+            self._pending_orders.pop(temp_id, None)
             if resp.get("retCode") != 0:
                 order.status = OrderStatus.REJECTED
                 logger.error("Limit order rifiutato: %s", resp)
@@ -281,8 +304,28 @@ class BybitFuturesExecutionGateway(ExecutionGateway):
             order.status = OrderStatus.OPEN
             self._pending_orders[order_id] = order
         except Exception as e:
+            self._pending_orders.pop(temp_id, None)
             logger.error("Errore submit_order: %s", e)
             order.status = OrderStatus.REJECTED
+
+    async def submit_limit_order_raw(
+        self, symbol: str, side: Side, size: Decimal, price: Decimal
+    ) -> Optional[Order]:
+        """Invia limit order e ritorna Order (per AggressiveChaser)."""
+        import uuid
+        order = Order(
+            id=str(uuid.uuid4()),
+            symbol=symbol,
+            side=side,
+            price=price,
+            size=size,
+            status=OrderStatus.PENDING,
+            filled_size=Decimal("0"),
+        )
+        await self.submit_order(order)
+        if order.status == OrderStatus.REJECTED:
+            return None
+        return order
 
     async def cancel_order(self, order: Order) -> None:
         body = {
@@ -546,26 +589,15 @@ class BybitFuturesExecutionGateway(ExecutionGateway):
 
     async def _acquire_rate_token(self) -> None:
         """
-        Acquisisce un token dal bucket. Se il bucket è vuoto, attende.
-        Refill: 10 token ogni secondo (= Bybit limit per Order endpoint).
+        Acquisisce un token dal semaphore. Se tutti i token sono in uso, attende.
+        Ogni token viene rilasciato dopo 1/max_rps secondi tramite task asincrono,
+        garantendo max max_rps richieste al secondo senza race condition.
         """
-        async with self._rate_lock:
-            now = time.monotonic()
-            elapsed = now - self._last_refill
-            # Ricarica proporzionale al tempo trascorso
-            refill = int(elapsed * self._max_rps)
-            if refill > 0:
-                self._rate_tokens = min(self._max_rps, self._rate_tokens + refill)
-                self._last_refill = now
-
-            if self._rate_tokens <= 0:
-                wait_time = 1.0 / self._max_rps
-                if self._rate_tokens < -3:
-                    logger.warning("Rate limit Bybit: troppo vicino al limite, attendo %.2fs", wait_time)
-                await asyncio.sleep(wait_time)
-                self._rate_tokens += 1
-            else:
-                self._rate_tokens -= 1
+        await self._rate_semaphore.acquire()
+        # Rilascia il token dopo 1/max_rps secondi (es. 0.1s per 10 rps)
+        asyncio.get_event_loop().call_later(
+            1.0 / self._max_rps, self._rate_semaphore.release
+        )
 
     def _is_permanent_error(self, ret_code: int) -> bool:
         """True se il codice errore Bybit non vale la pena riprovare."""

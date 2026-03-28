@@ -166,6 +166,9 @@ class BybitFuturesDataGateway:
                         )
                         backoff = 1
 
+                        # Gap fill: recupera candle perse durante la disconnessione
+                        await self._fill_reconnect_gaps()
+
                         async for msg in ws:
                             if not self._running:
                                 break
@@ -243,6 +246,72 @@ class BybitFuturesDataGateway:
 
         except Exception as e:
             logger.error("Errore parsing WS: %s", e)
+
+    async def _fill_reconnect_gaps(self) -> None:
+        """
+        Dopo reconnessione WS, detecta gap nelle candle e recupera
+        le mancanti via REST API per mantenere gli indicatori accurati.
+        """
+        now = time.time()
+        tf_seconds = {
+            "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+            "1h": 3600, "2h": 7200, "4h": 14400,
+        }
+        for sym in self._symbols:
+            for tf in self._timeframes:
+                key = f"{sym}_{tf}"
+                last_ts = self._last_candle_ts.get(key, 0)
+                if last_ts <= 0:
+                    continue
+                gap_s = now - last_ts
+                tf_s = tf_seconds.get(tf, 900)
+                # Se gap > 2× la durata del timeframe, recupera candle mancanti
+                if gap_s > tf_s * 2:
+                    n_missed = int(gap_s / tf_s)
+                    logger.warning(
+                        "Gap detected %s %s: %.0fs gap (~%d candle). Fetching...",
+                        sym, tf, gap_s, n_missed,
+                    )
+                    try:
+                        candles = await self._fetch_gap_candles(
+                            sym, tf, int(last_ts * 1000), int(now * 1000), min(n_missed + 2, 200)
+                        )
+                        for c in candles:
+                            if c.timestamp > last_ts:
+                                await self._on_candle_close(sym, c)
+                                self._last_candle_ts[key] = c.timestamp
+                        logger.info("Gap filled: %s %s → %d candle recuperate", sym, tf, len(candles))
+                    except Exception as e:
+                        logger.error("Gap fill failed %s %s: %s", sym, tf, e)
+
+    async def _fetch_gap_candles(
+        self, symbol: str, timeframe: str, start_ms: int, end_ms: int, limit: int
+    ) -> list:
+        """Fetch candle mancanti via REST per riempire il gap."""
+        interval = _TF_MAP.get(timeframe, "15")
+        params = {
+            "category": "linear", "symbol": symbol,
+            "interval": interval, "start": start_ms, "end": end_ms, "limit": limit,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{self._rest_base}/v5/market/kline", params=params,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json()
+                if data.get("retCode") != 0:
+                    return []
+                rows = data.get("result", {}).get("list", [])
+                candles = []
+                for row in reversed(rows):
+                    ts = int(row[0]) / 1000.0
+                    candles.append(Candle(
+                        symbol=symbol, timeframe=timeframe,
+                        open=Decimal(str(row[1])), high=Decimal(str(row[2])),
+                        low=Decimal(str(row[3])), close=Decimal(str(row[4])),
+                        volume=Decimal(str(row[5])), timestamp=ts, is_closed=True,
+                    ))
+                return candles
 
 
 # ------------------------------------------------------------------

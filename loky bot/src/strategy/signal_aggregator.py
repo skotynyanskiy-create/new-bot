@@ -22,6 +22,7 @@ Soglie:
 """
 
 import logging
+import math
 from decimal import Decimal
 from typing import Optional
 
@@ -63,9 +64,16 @@ class SignalAggregator:
         self,
         indicators: IndicatorEngine,
         htf_indicators: Optional[IndicatorEngine] = None,
+        macro_indicators: Optional[IndicatorEngine] = None,
     ) -> None:
-        self._ind     = indicators
-        self._htf_ind = htf_indicators
+        self._ind       = indicators
+        self._htf_ind   = htf_indicators
+        self._macro_ind = macro_indicators
+
+        # Adaptive strategy weights: traccia performance rolling per strategia
+        # {strategy_name: {"wins": int, "losses": int, "pnl": Decimal}}
+        self._strategy_stats: dict[str, dict] = {}
+        self._strategy_weight_cache: dict[str, Decimal] = {}
 
     # ------------------------------------------------------------------
     # Regime detection
@@ -111,53 +119,131 @@ class SignalAggregator:
 
     def score(self, signal: Signal) -> Decimal:
         """
-        Calcola score 0-100 per il segnale dato.
-        Il segnale ha già uno score base impostato dall'engine.
-        Qui applichiamo bonus/penalità contestuali.
+        Scoring 0-100 con approccio confluence-first.
+
+        Pesi (rivisti per massima profittabilità):
+          Trend strength (ADX)    : 25%  — trend forti hanno momentum
+          HTF alignment (1h)      : 25%  — previene whipsaw
+          Confluence TF (4h)      : 20%  — triple TF = segnale istituzionale
+          Volume confirmation     : 15%  — valida il movimento
+          Strategy weight         : 15%  — premia strategie vincenti
+
+        Il base score dell'engine vale come floor (non viene ignorato).
         """
         if signal.signal_type == SignalType.NONE:
             return _ZERO
 
-        base = signal.score  # score impostato dall'engine (es. 65, 72, 80)
+        base = signal.score  # score dall'engine (65, 72, 80)
 
-        # Bonus ADX strength
+        # --- 1. Trend Strength (25%) ---
+        # ADX normalizzato su range 0-60 (più realistico di 0-50)
         try:
             adx_val = self._ind.adx()
-            adx_normalized = min(adx_val / Decimal('50'), _ONE) * Decimal('10')
+            trend_score = min(adx_val / Decimal('60'), _ONE) * Decimal('25')
         except ValueError:
-            adx_normalized = _ZERO
+            trend_score = Decimal('12')  # neutro
 
-        # Bonus volume: volume sopra la media → conferma del segnale
-        try:
-            vol_ratio = self._ind.volume_ratio()
-            # Volume > 1.5× media → +5, > 2× → +8, < 0.5× → -3
-            if vol_ratio >= Decimal('2.0'):
-                vol_bonus = Decimal('8')
-            elif vol_ratio >= Decimal('1.5'):
-                vol_bonus = Decimal('5')
-            elif vol_ratio < Decimal('0.5'):
-                vol_bonus = Decimal('-3')
-            else:
-                vol_bonus = _ZERO
-        except ValueError:
-            vol_bonus = _ZERO
-
-        # HTF alignment bonus
-        htf_bonus = _ZERO
+        # --- 2. HTF Alignment (25%) ---
+        # Gradiente: forte allineamento = 25pt, forte contrario = -15pt
+        htf_score = _ZERO
+        htf_aligned = False
         if self._htf_ind is not None:
             try:
                 htf_fast = self._htf_ind.ema_fast()
                 htf_slow = self._htf_ind.ema_slow()
-                if signal.signal_type == SignalType.LONG and htf_fast > htf_slow:
-                    htf_bonus = Decimal('8')
-                elif signal.signal_type == SignalType.SHORT and htf_fast < htf_slow:
-                    htf_bonus = Decimal('8')
-                else:
-                    htf_bonus = Decimal('-5')  # HTF contrario = penalità
+                if htf_slow > _ZERO:
+                    ema_spread = (htf_fast - htf_slow) / htf_slow
+                    if signal.signal_type == SignalType.SHORT:
+                        ema_spread = -ema_spread
+                    # Simmetrico: ±20 (stessa penalità per contrario e premio per allineato)
+                    htf_score = min(max(ema_spread * Decimal('2000'), Decimal('-20')), Decimal('20'))
+                    if ema_spread > Decimal('0.001'):  # >0.1% spread = definitivamente allineato
+                        htf_aligned = True
             except ValueError:
                 pass
 
-        final_score = min(base + adx_normalized + vol_bonus + htf_bonus, _HUNDRED)
+        # --- 3. Confluence TF (20%) ---
+        # Macro (4h) allineamento + conteggio TF
+        tf_aligned = 1  # primary sempre allineato
+        if htf_aligned:
+            tf_aligned += 1
+        macro_aligned = False
+        if self._macro_ind is not None:
+            try:
+                macro_fast = self._macro_ind.ema_fast()
+                macro_slow = self._macro_ind.ema_slow()
+                if macro_slow > _ZERO:
+                    macro_spread = (macro_fast - macro_slow) / macro_slow
+                    if signal.signal_type == SignalType.SHORT:
+                        macro_spread = -macro_spread
+                    if macro_spread > Decimal('0.001'):
+                        tf_aligned += 1
+                        macro_aligned = True
+            except ValueError:
+                pass
+
+        # Confluence scaling: 3TF=20pt, 2TF=12pt, 1TF=4pt (penalità forte)
+        if tf_aligned >= 3:
+            confluence_score = Decimal('20')
+        elif tf_aligned == 2:
+            confluence_score = Decimal('12')
+        else:
+            confluence_score = Decimal('4')
+
+        # --- 4. Volume Confirmation (15%) ---
+        # Percentile-based: volume rank nella rolling window
+        try:
+            vol_ratio = self._ind.volume_ratio()
+            if vol_ratio > _ZERO:
+                log_vol = Decimal(str(math.log2(max(float(vol_ratio), 0.25))))
+                vol_score = max(Decimal('0'), min((log_vol + Decimal('1')) * Decimal('7.5'), Decimal('15')))
+            else:
+                vol_score = _ZERO
+        except (ValueError, OverflowError):
+            vol_score = Decimal('7')  # neutro
+
+        # --- 5. Strategy Weight (15%) ---
+        strat_weight = self.strategy_weight(signal.strategy_name)
+        # Converti peso (0.6-1.2) in punti (0-15)
+        strat_score = min((strat_weight - Decimal('0.5')) * Decimal('21.4'), Decimal('15'))
+        strat_score = max(_ZERO, strat_score)
+
+        # --- 6. MACD Momentum Confirmation (bonus/malus) ---
+        macd_bonus = _ZERO
+        try:
+            hist = self._ind.macd_histogram()
+            if signal.signal_type == SignalType.LONG and hist > _ZERO:
+                macd_bonus = Decimal('3')  # histogram positivo conferma LONG
+            elif signal.signal_type == SignalType.SHORT and hist < _ZERO:
+                macd_bonus = Decimal('3')  # histogram negativo conferma SHORT
+            # MACD divergence: forte segnale contrarian
+            if self._ind.macd_bearish_divergence() and signal.signal_type == SignalType.LONG:
+                macd_bonus = Decimal('-8')  # reversal imminente, penalizza LONG
+            elif self._ind.macd_bullish_divergence() and signal.signal_type == SignalType.SHORT:
+                macd_bonus = Decimal('-8')  # reversal imminente, penalizza SHORT
+        except ValueError:
+            pass
+
+        # --- 7. StochRSI Entry Timing (bonus) ---
+        stoch_bonus = _ZERO
+        try:
+            if signal.signal_type == SignalType.LONG and self._ind.stoch_oversold_bounce():
+                stoch_bonus = Decimal('5')  # timing ottimale per LONG
+            elif signal.signal_type == SignalType.SHORT and self._ind.stoch_overbought_drop():
+                stoch_bonus = Decimal('5')  # timing ottimale per SHORT
+        except ValueError:
+            pass
+
+        # Score contestuale
+        context_score = (
+            trend_score + htf_score + confluence_score + vol_score + strat_score
+            + macd_bonus + stoch_bonus
+        )
+
+        # Blend 50/50: engine e contesto hanno qualità comparabile
+        # (contesto include MACD, StochRSI, confluence TF, volume log, adaptive weights)
+        blended = base * Decimal('0.50') + context_score * Decimal('0.50')
+        final_score = max(_ZERO, min(blended, _HUNDRED))
         return final_score.quantize(Decimal('0.1'))
 
     # ------------------------------------------------------------------
@@ -208,6 +294,73 @@ class SignalAggregator:
     # ------------------------------------------------------------------
     # Helper regime → strategie consigliate
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Adaptive strategy weights
+    # ------------------------------------------------------------------
+
+    def record_trade_result(self, strategy_name: str, pnl: Decimal) -> None:
+        """Registra il risultato di un trade per una strategia."""
+        if strategy_name not in self._strategy_stats:
+            self._strategy_stats[strategy_name] = {
+                "wins": 0, "losses": 0, "pnl": _ZERO,
+                "total_win_pnl": _ZERO, "total_loss_pnl": _ZERO,
+            }
+
+        stats = self._strategy_stats[strategy_name]
+        stats["pnl"] += pnl
+        if pnl > _ZERO:
+            stats["wins"] += 1
+            stats["total_win_pnl"] += pnl
+        else:
+            stats["losses"] += 1
+            stats["total_loss_pnl"] += abs(pnl)
+
+        self._update_strategy_weights()
+
+    def _update_strategy_weights(self) -> None:
+        """
+        Pesi adattivi basati su EXPECTANCY reale, non solo win rate.
+
+        E[X] = (win_rate × avg_win) - (loss_rate × avg_loss)
+
+        Una strategia con 60% WR ma avg_win < avg_loss ha E[X] negativo
+        e viene penalizzata, anche se vince più spesso di quanto perde.
+        """
+        for name, stats in self._strategy_stats.items():
+            total = stats["wins"] + stats["losses"]
+            if total < 10:
+                self._strategy_weight_cache[name] = _ONE
+                continue  # Dati insufficienti per expectancy stabile
+
+            win_rate = Decimal(stats["wins"]) / Decimal(total)
+            loss_rate = _ONE - win_rate
+
+            avg_win = stats["total_win_pnl"] / Decimal(max(stats["wins"], 1))
+            avg_loss = stats["total_loss_pnl"] / Decimal(max(stats["losses"], 1))
+
+            expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
+
+            # Peso basato su expectancy (non win rate)
+            if expectancy > avg_win * Decimal('0.3'):
+                weight = Decimal('1.3')    # expectancy forte
+            elif expectancy > _ZERO:
+                weight = Decimal('1.1')    # expectancy positiva
+            elif expectancy > -(avg_loss * Decimal('0.1')):
+                weight = _ONE              # circa breakeven
+            else:
+                weight = Decimal('0.5')    # expectancy negativa → penalizza
+
+            self._strategy_weight_cache[name] = weight
+            logger.debug(
+                "Strategy weight: %s → %.1f (E[X]=%.2f WR=%.0f%% avgW=%.2f avgL=%.2f n=%d)",
+                name, float(weight), float(expectancy),
+                float(win_rate * 100), float(avg_win), float(avg_loss), total,
+            )
+
+    def strategy_weight(self, strategy_name: str) -> Decimal:
+        """Ritorna il peso adattivo per una strategia (default 1.0)."""
+        return self._strategy_weight_cache.get(strategy_name, _ONE)
 
     def preferred_strategies(self) -> list[str]:
         """

@@ -13,9 +13,17 @@ from typing import Optional
 from src.models import Candle
 
 
-_ZERO = Decimal('0')
-_ONE  = Decimal('1')
-_TWO  = Decimal('2')
+_ZERO       = Decimal('0')
+_ONE        = Decimal('1')
+_TWO        = Decimal('2')
+_THREE      = Decimal(3)
+_NINE       = Decimal(9)
+_TWELVE     = Decimal(12)
+_TWENTY_SIX = Decimal(26)
+_FIFTY      = Decimal(50)
+_HUNDRED    = Decimal(100)
+_PREC_2     = Decimal('0.01')
+_KELTNER_M  = Decimal('1.5')
 
 # Periodi EMA Ribbon fissi
 _RIBBON_PERIODS = (8, 13, 21, 34, 55)
@@ -97,12 +105,37 @@ class IndicatorEngine:
         self._bb_upper_val:  Optional[Decimal] = None
         self._bb_lower_val:  Optional[Decimal] = None
         self._bb_middle_val: Optional[Decimal] = None
+        self._bb_width_val:  Optional[Decimal] = None
+        self._bb_sum:        Optional[Decimal] = None  # running sum per O(1) BB
+        self._bb_sumsq:      Optional[Decimal] = None  # running sum of squares
 
         # --- EMA Ribbon (8, 13, 21, 34, 55) ---
         self._ribbon_vals:  dict[int, Optional[Decimal]] = {p: None for p in _RIBBON_PERIODS}
         self._ribbon_k:     dict[int, Decimal] = {
             p: _TWO / (Decimal(p) + _ONE) for p in _RIBBON_PERIODS
         }
+
+        # --- MACD (12, 26, 9) ---
+        self._ema12: Optional[Decimal] = None
+        self._ema26: Optional[Decimal] = None
+        self._macd_signal: Optional[Decimal] = None
+        self._macd_val: Optional[Decimal] = None
+        self._macd_hist: Optional[Decimal] = None
+        self._k12 = _TWO / (_TWELVE + _ONE)
+        self._k26 = _TWO / (_TWENTY_SIX + _ONE)
+        self._k9  = _TWO / (_NINE + _ONE)
+        self._hist_peaks: deque[Decimal] = deque(maxlen=5)
+        self._hist_valleys: deque[Decimal] = deque(maxlen=5)
+        self._price_at_hist_peak: deque[Decimal] = deque(maxlen=5)
+        self._price_at_hist_valley: deque[Decimal] = deque(maxlen=5)
+
+        # --- Stochastic RSI (14, 3, 3) ---
+        self._rsi_history: deque[Decimal] = deque(maxlen=14)
+        self._stoch_rsi_val: Optional[Decimal] = None
+        self._stoch_k_vals: deque[Decimal] = deque(maxlen=3)
+        self._stoch_k: Optional[Decimal] = None
+        self._stoch_d_vals: deque[Decimal] = deque(maxlen=3)
+        self._stoch_d: Optional[Decimal] = None
 
         # --- VWAP intraday (reset ogni nuovo giorno UTC) ---
         self._vwap_cum_pv:  Decimal = _ZERO   # Σ(typical_price × volume)
@@ -134,6 +167,8 @@ class IndicatorEngine:
         self._update_adx(candle, prev)
         self._update_bb()
         self._update_ribbon(candle)
+        self._update_macd(candle)
+        self._update_stoch_rsi()
         self._update_vwap(candle)
 
     # ------------------------------------------------------------------
@@ -168,10 +203,10 @@ class IndicatorEngine:
         if self._avg_gain is None or self._avg_loss is None:
             raise ValueError("RSI non ancora disponibile")
         if self._avg_loss == _ZERO:
-            return Decimal('100')
+            return _HUNDRED
         rs = self._avg_gain / self._avg_loss
-        return (Decimal('100') - (Decimal('100') / (_ONE + rs))).quantize(
-            Decimal('0.01'), rounding=ROUND_HALF_UP
+        return (_HUNDRED - (_HUNDRED / (_ONE + rs))).quantize(
+            _PREC_2, rounding=ROUND_HALF_UP
         )
 
     def atr(self) -> Decimal:
@@ -184,7 +219,8 @@ class IndicatorEngine:
         """Media mobile semplice del volume sulle ultime vol_period candele."""
         if len(self._candles) < self._vol_period:
             raise ValueError("Volume MA non ancora disponibile")
-        recent = list(self._candles)[-self._vol_period:]
+        start = max(0, len(self._candles) - self._vol_period)
+        recent = itertools.islice(self._candles, start, len(self._candles))
         return sum(c.volume for c in recent) / Decimal(self._vol_period)
 
     def volume_ratio(self) -> Decimal:
@@ -274,12 +310,62 @@ class IndicatorEngine:
         return self._bb_middle_val
 
     def bb_width(self) -> Decimal:
-        """BB Width = (upper - lower) / middle. Misura di volatilità."""
-        if self._bb_upper_val is None or self._bb_middle_val is None:
+        """BB Width = (upper - lower) / middle. Cached at update time."""
+        if self._bb_width_val is None:
             raise ValueError("Bollinger Bands non ancora disponibili")
-        if self._bb_middle_val == _ZERO:
-            return _ZERO
-        return (self._bb_upper_val - self._bb_lower_val) / self._bb_middle_val
+        return self._bb_width_val
+
+    # ------------------------------------------------------------------
+    # Keltner Channel & Squeeze
+    # ------------------------------------------------------------------
+
+    def keltner_upper(self, mult: Decimal = _KELTNER_M) -> Decimal:
+        """Keltner upper = EMA20 + mult × ATR."""
+        ema = self.bb_middle()  # EMA20 (stessa base delle BB)
+        atr = self.atr()
+        return ema + mult * atr
+
+    def keltner_lower(self, mult: Decimal = _KELTNER_M) -> Decimal:
+        """Keltner lower = EMA20 - mult × ATR."""
+        ema = self.bb_middle()
+        atr = self.atr()
+        return ema - mult * atr
+
+    def is_squeeze(self) -> bool:
+        """
+        Bollinger Bands Squeeze: BB dentro il Keltner Channel.
+        Quando BB upper < Keltner upper AND BB lower > Keltner lower,
+        la volatilità è compressa → breakout imminente.
+
+        Usato come trigger per entry su breakout strategy.
+        """
+        try:
+            return (
+                self.bb_upper() < self.keltner_upper()
+                and self.bb_lower() > self.keltner_lower()
+            )
+        except ValueError:
+            return False
+
+    def squeeze_release(self) -> Optional[str]:
+        """
+        Detecta il rilascio dello squeeze (BB esce dal Keltner).
+        Ritorna 'bullish' se il prezzo è sopra BB middle, 'bearish' se sotto.
+        """
+        try:
+            if not self.is_squeeze():
+                # Non in squeeze — controlla se appena uscito
+                bb_w = self.bb_width()
+                if bb_w < Decimal('0.02'):  # ancora compresso ma uscendo
+                    return None
+                # Direzione del breakout
+                if self._candles and self._candles[-1].close > self.bb_middle():
+                    return "bullish"
+                elif self._candles and self._candles[-1].close < self.bb_middle():
+                    return "bearish"
+        except ValueError:
+            pass
+        return None
 
     # ------------------------------------------------------------------
     # Proprietà pubbliche — EMA Ribbon
@@ -344,15 +430,19 @@ class IndicatorEngine:
         price = candle.close
         if self._ema_fast_val is None:
             if self._n >= self._ema_fast_period:
-                buf = list(self._candles)[-self._ema_fast_period:]
-                self._ema_fast_val = sum(c.close for c in buf) / Decimal(self._ema_fast_period)
+                start = max(0, len(self._candles) - self._ema_fast_period)
+                self._ema_fast_val = sum(
+                    c.close for c in itertools.islice(self._candles, start, len(self._candles))
+                ) / Decimal(self._ema_fast_period)
         else:
             self._ema_fast_val = (price - self._ema_fast_val) * self._k_fast + self._ema_fast_val
 
         if self._ema_slow_val is None:
             if self._n >= self._ema_slow_period:
-                buf = list(self._candles)[-self._ema_slow_period:]
-                self._ema_slow_val = sum(c.close for c in buf) / Decimal(self._ema_slow_period)
+                start = max(0, len(self._candles) - self._ema_slow_period)
+                self._ema_slow_val = sum(
+                    c.close for c in itertools.islice(self._candles, start, len(self._candles))
+                ) / Decimal(self._ema_slow_period)
         else:
             self._ema_slow_val = (price - self._ema_slow_val) * self._k_slow + self._ema_slow_val
 
@@ -429,14 +519,14 @@ class IndicatorEngine:
                 self._dx_values.clear()  # reset per uso DX
                 # Prima DI+/DI-
                 if self._adx_tr_smooth > _ZERO:
-                    self._di_plus_val  = (self._adx_dm_plus_s  / self._adx_tr_smooth * Decimal('100')).quantize(Decimal('0.01'))
-                    self._di_minus_val = (self._adx_dm_minus_s / self._adx_tr_smooth * Decimal('100')).quantize(Decimal('0.01'))
+                    self._di_plus_val  = (self._adx_dm_plus_s  / self._adx_tr_smooth * _HUNDRED).quantize(_PREC_2)
+                    self._di_minus_val = (self._adx_dm_minus_s / self._adx_tr_smooth * _HUNDRED).quantize(_PREC_2)
                 else:
                     self._di_plus_val  = _ZERO
                     self._di_minus_val = _ZERO
                 # Prima DX → feed per ADX seed
                 di_sum  = self._di_plus_val + self._di_minus_val
-                dx = (abs(self._di_plus_val - self._di_minus_val) / di_sum * Decimal('100')) if di_sum != _ZERO else _ZERO
+                dx = (abs(self._di_plus_val - self._di_minus_val) / di_sum * _HUNDRED) if di_sum != _ZERO else _ZERO
                 self._dx_values.append(dx)
         else:
             # Wilder smoothing: smooth = smooth - smooth/period + current
@@ -445,14 +535,14 @@ class IndicatorEngine:
             self._adx_dm_minus_s = self._adx_dm_minus_s - self._adx_dm_minus_s / period + dm_minus
 
             if self._adx_tr_smooth > _ZERO:
-                self._di_plus_val  = (self._adx_dm_plus_s  / self._adx_tr_smooth * Decimal('100')).quantize(Decimal('0.01'))
-                self._di_minus_val = (self._adx_dm_minus_s / self._adx_tr_smooth * Decimal('100')).quantize(Decimal('0.01'))
+                self._di_plus_val  = (self._adx_dm_plus_s  / self._adx_tr_smooth * _HUNDRED).quantize(_PREC_2)
+                self._di_minus_val = (self._adx_dm_minus_s / self._adx_tr_smooth * _HUNDRED).quantize(_PREC_2)
             else:
                 self._di_plus_val  = _ZERO
                 self._di_minus_val = _ZERO
 
             di_sum = self._di_plus_val + self._di_minus_val
-            dx = (abs(self._di_plus_val - self._di_minus_val) / di_sum * Decimal('100')) if di_sum != _ZERO else _ZERO
+            dx = (abs(self._di_plus_val - self._di_minus_val) / di_sum * _HUNDRED) if di_sum != _ZERO else _ZERO
             self._dx_values.append(dx)
 
             if self._adx_val is None:
@@ -462,27 +552,55 @@ class IndicatorEngine:
             else:
                 # Wilder smoothing ADX
                 self._adx_val = (self._adx_val * (period - _ONE) + dx) / period
-                self._adx_val = self._adx_val.quantize(Decimal('0.01'))
+                self._adx_val = self._adx_val.quantize(_PREC_2)
 
     # ------------------------------------------------------------------
     # Metodi privati di calcolo — Bollinger Bands
     # ------------------------------------------------------------------
 
     def _update_bb(self) -> None:
-        if len(self._candles) < self._bb_period:
+        n_candles = len(self._candles)
+        if n_candles < self._bb_period:
             return
 
-        closes = [c.close for c in list(self._candles)[-self._bb_period:]]
         n = Decimal(self._bb_period)
-        mean = sum(closes) / n
+        new_close = self._candles[-1].close
 
-        # Deviazione standard (population std)
-        variance = sum((c - mean) ** 2 for c in closes) / n
+        # Incrementale O(1): mantieni running sum e sum-of-squares
+        if not hasattr(self, '_bb_sum') or self._bb_sum is None:
+            # Prima inizializzazione: calcola da zero
+            start = max(0, n_candles - self._bb_period)
+            window = list(itertools.islice(self._candles, start, n_candles))
+            self._bb_sum = sum(c.close for c in window)
+            self._bb_sumsq = sum(c.close ** 2 for c in window)
+        else:
+            # Incrementale: rimuovi il più vecchio, aggiungi il più nuovo
+            if n_candles > self._bb_period:
+                old_idx = n_candles - self._bb_period - 1
+                old_close = list(itertools.islice(self._candles, old_idx, old_idx + 1))[0].close
+                self._bb_sum = self._bb_sum - old_close + new_close
+                self._bb_sumsq = self._bb_sumsq - old_close ** 2 + new_close ** 2
+            else:
+                # Esattamente bb_period candle: ricalcola (raro)
+                start = max(0, n_candles - self._bb_period)
+                window = list(itertools.islice(self._candles, start, n_candles))
+                self._bb_sum = sum(c.close for c in window)
+                self._bb_sumsq = sum(c.close ** 2 for c in window)
+
+        mean = self._bb_sum / n
+        # Varianza = E[X²] - E[X]² (formula computazionale, O(1))
+        variance = (self._bb_sumsq / n) - (mean ** 2)
+        if variance < _ZERO:
+            variance = _ZERO  # floating point guard
         std = variance.sqrt()
 
         self._bb_middle_val = mean
         self._bb_upper_val  = mean + self._bb_std * std
         self._bb_lower_val  = mean - self._bb_std * std
+        if mean > _ZERO:
+            self._bb_width_val = (self._bb_upper_val - self._bb_lower_val) / mean
+        else:
+            self._bb_width_val = _ZERO
 
     # ------------------------------------------------------------------
     # Metodi privati di calcolo — EMA Ribbon
@@ -493,11 +611,147 @@ class IndicatorEngine:
         for period in _RIBBON_PERIODS:
             if self._ribbon_vals[period] is None:
                 if self._n >= period:
-                    buf = list(self._candles)[-period:]
-                    self._ribbon_vals[period] = sum(c.close for c in buf) / Decimal(period)
+                    start = max(0, len(self._candles) - period)
+                    self._ribbon_vals[period] = sum(
+                        c.close for c in itertools.islice(self._candles, start, len(self._candles))
+                    ) / Decimal(period)
             else:
                 k = self._ribbon_k[period]
                 self._ribbon_vals[period] = (price - self._ribbon_vals[period]) * k + self._ribbon_vals[period]
+
+    # ------------------------------------------------------------------
+    # MACD (12, 26, 9) + Divergence
+    # ------------------------------------------------------------------
+
+    def _update_macd(self, candle: Candle) -> None:
+        price = candle.close
+        # EMA12
+        if self._ema12 is None:
+            if self._n >= 12:
+                start = max(0, len(self._candles) - 12)
+                self._ema12 = sum(
+                    c.close for c in itertools.islice(self._candles, start, len(self._candles))
+                ) / _TWELVE
+        else:
+            self._ema12 = (price - self._ema12) * self._k12 + self._ema12
+        # EMA26
+        if self._ema26 is None:
+            if self._n >= 26:
+                start = max(0, len(self._candles) - 26)
+                self._ema26 = sum(
+                    c.close for c in itertools.islice(self._candles, start, len(self._candles))
+                ) / _TWENTY_SIX
+        else:
+            self._ema26 = (price - self._ema26) * self._k26 + self._ema26
+        # MACD line
+        if self._ema12 is not None and self._ema26 is not None:
+            self._macd_val = self._ema12 - self._ema26
+            # Signal line (9-EMA of MACD)
+            if self._macd_signal is None:
+                self._macd_signal = self._macd_val
+            else:
+                self._macd_signal = (self._macd_val - self._macd_signal) * self._k9 + self._macd_signal
+            # Histogram
+            prev_hist = self._macd_hist
+            self._macd_hist = self._macd_val - self._macd_signal
+            # Traccia peaks/valleys dell'histogram per divergence detection
+            if prev_hist is not None and self._macd_hist is not None:
+                if prev_hist > _ZERO and self._macd_hist <= _ZERO:
+                    self._hist_peaks.append(prev_hist)
+                    self._price_at_hist_peak.append(price)
+                elif prev_hist < _ZERO and self._macd_hist >= _ZERO:
+                    self._hist_valleys.append(prev_hist)
+                    self._price_at_hist_valley.append(price)
+
+    def macd(self) -> Decimal:
+        if self._macd_val is None:
+            raise ValueError("MACD non disponibile")
+        return self._macd_val
+
+    def macd_signal(self) -> Decimal:
+        if self._macd_signal is None:
+            raise ValueError("MACD signal non disponibile")
+        return self._macd_signal
+
+    def macd_histogram(self) -> Decimal:
+        if self._macd_hist is None:
+            raise ValueError("MACD histogram non disponibile")
+        return self._macd_hist
+
+    def macd_bearish_divergence(self) -> bool:
+        """Price higher high + histogram lower high = reversal bearish."""
+        if len(self._hist_peaks) < 2 or len(self._price_at_hist_peak) < 2:
+            return False
+        return (
+            self._price_at_hist_peak[-1] > self._price_at_hist_peak[-2]
+            and self._hist_peaks[-1] < self._hist_peaks[-2]
+        )
+
+    def macd_bullish_divergence(self) -> bool:
+        """Price lower low + histogram higher low = reversal bullish."""
+        if len(self._hist_valleys) < 2 or len(self._price_at_hist_valley) < 2:
+            return False
+        return (
+            self._price_at_hist_valley[-1] < self._price_at_hist_valley[-2]
+            and self._hist_valleys[-1] > self._hist_valleys[-2]
+        )
+
+    # ------------------------------------------------------------------
+    # Stochastic RSI (14, 3, 3)
+    # ------------------------------------------------------------------
+
+    def _update_stoch_rsi(self) -> None:
+        try:
+            current_rsi = self.rsi()
+        except ValueError:
+            return
+        self._rsi_history.append(current_rsi)
+        if len(self._rsi_history) < 14:
+            return
+        rsi_min = min(self._rsi_history)
+        rsi_max = max(self._rsi_history)
+        rsi_range = rsi_max - rsi_min
+        if rsi_range <= _ZERO:
+            self._stoch_rsi_val = _FIFTY
+        else:
+            self._stoch_rsi_val = ((current_rsi - rsi_min) / rsi_range) * _HUNDRED
+        # K% = 3-SMA of StochRSI
+        self._stoch_k_vals.append(self._stoch_rsi_val)
+        if len(self._stoch_k_vals) >= 3:
+            self._stoch_k = sum(self._stoch_k_vals) / Decimal(len(self._stoch_k_vals))
+            # D% = 3-SMA of K%
+            self._stoch_d_vals.append(self._stoch_k)
+            if len(self._stoch_d_vals) >= 3:
+                self._stoch_d = sum(self._stoch_d_vals) / Decimal(len(self._stoch_d_vals))
+
+    def stoch_rsi(self) -> Decimal:
+        if self._stoch_rsi_val is None:
+            raise ValueError("StochRSI non disponibile")
+        return self._stoch_rsi_val
+
+    def stoch_k(self) -> Decimal:
+        if self._stoch_k is None:
+            raise ValueError("StochRSI K% non disponibile")
+        return self._stoch_k
+
+    def stoch_d(self) -> Decimal:
+        if self._stoch_d is None:
+            raise ValueError("StochRSI D% non disponibile")
+        return self._stoch_d
+
+    def stoch_oversold_bounce(self) -> bool:
+        """True se K% rimbalza da zona ipervenduta (<20) verso l'alto."""
+        if len(self._stoch_k_vals) < 3:
+            return False
+        vals = list(self._stoch_k_vals)
+        return vals[-2] < Decimal(20) and vals[-1] > vals[-2]
+
+    def stoch_overbought_drop(self) -> bool:
+        """True se K% scende da zona ipercomprata (>80) verso il basso."""
+        if len(self._stoch_k_vals) < 3:
+            return False
+        vals = list(self._stoch_k_vals)
+        return vals[-2] > Decimal(80) and vals[-1] < vals[-2]
 
     # ------------------------------------------------------------------
     # Metodi privati di calcolo — VWAP intraday
@@ -512,14 +766,15 @@ class IndicatorEngine:
         if self._n - self._sr_cache_n < self._sr_cache_interval and self._sr_cache_n > 0:
             return
 
-        buf = list(self._candles)
-        if len(buf) < 5:
+        n = len(self._candles)
+        if n < 5:
             self._sr_support_cache = []
             self._sr_resistance_cache = []
             self._sr_cache_n = self._n
             return
 
-        window = buf[-lookback:] if len(buf) >= lookback else buf
+        start = max(0, n - lookback)
+        window = list(itertools.islice(self._candles, start, n))
 
         # Support pivots
         sup_pivots: list[Decimal] = []
@@ -613,7 +868,7 @@ class IndicatorEngine:
         self._vwap_date = candle_date
 
         # Typical price = (H + L + C) / 3
-        typical = (candle.high + candle.low + candle.close) / Decimal('3')
+        typical = (candle.high + candle.low + candle.close) / _THREE
         self._vwap_cum_pv  += typical * candle.volume
         self._vwap_cum_vol += candle.volume
 

@@ -73,7 +73,7 @@ class StrategySettings(BaseModel):
     scale_in_profit_atr_mult: Decimal = Decimal('0.5')  # profitto minimo (in ATR) per attivare scale-in
 
     # --- Regime avanzato ---
-    choppy_market_pause: bool = True   # ADX < 15 = mercato choppy → nessun trade
+    # choppy_market_pause rimosso v6.5 — il CHOPPY block è gestito da is_choppy_market() nell'aggregator
 
     @field_validator('sl_atr_mult')
     @classmethod
@@ -139,7 +139,7 @@ class BotSettings(BaseSettings):
     risk_per_trade_pct: Decimal = Decimal('0.015')
     max_concurrent_positions: int = 2
     leverage: int = 3
-    max_daily_loss: Decimal = Decimal('-30')
+    max_daily_loss_pct: Decimal = Decimal('0.05')      # 5% del capitale = daily stop (scala col capitale)
     max_peak_drawdown_pct: Decimal = Decimal('0.15')   # halt se drawdown > 15% dal picco equity
     max_position_per_asset: Decimal = Decimal('0.05')
 
@@ -195,11 +195,11 @@ class BotSettings(BaseSettings):
             raise ValueError(f"leverage deve essere tra 1 e 20, ricevuto: {v}")
         return v
 
-    @field_validator('max_daily_loss')
+    @field_validator('max_daily_loss_pct')
     @classmethod
-    def daily_loss_must_be_negative(cls, v: Decimal) -> Decimal:
-        if v >= Decimal('0'):
-            raise ValueError(f"max_daily_loss deve essere negativo (es. -30), ricevuto: {v}")
+    def daily_loss_pct_valid(cls, v: Decimal) -> Decimal:
+        if v <= Decimal('0') or v > Decimal('0.50'):
+            raise ValueError(f"max_daily_loss_pct deve essere tra 0 e 50% (0.50), ricevuto: {v}")
         return v
 
     @field_validator('max_leverage')
@@ -255,7 +255,7 @@ class BotSettings(BaseSettings):
         logger.info("  Timeframe      : %s + %s (HTF)", self.primary_timeframe, self.confirmation_timeframe)
         logger.info("  Leverage       : %dx (max %dx)", self.leverage, self.max_leverage)
         logger.info("  Risk/trade     : %.1f%%", float(self.risk_per_trade_pct) * 100)
-        logger.info("  Daily stop     : %.0f USDT", float(self.max_daily_loss))
+        logger.info("  Daily stop     : %.1f%% del capitale", float(self.max_daily_loss_pct) * 100)
         logger.info("  Peak DD stop   : %.0f%%", float(self.max_peak_drawdown_pct) * 100)
         logger.info("  Kelly sizing   : %s (min %d trade)", self.kelly_sizing_enabled, self.kelly_min_trades)
         logger.info("=" * 55)
@@ -267,6 +267,11 @@ class BotSettings(BaseSettings):
             logger.warning("⚠️  Leverage %dx è molto elevato — rischio liquidazione!", self.leverage)
         if self.live_trading_enabled and not self.testnet:
             logger.warning("🔴 LIVE TRADING ATTIVO — ordini reali verranno inviati!")
+        elif not self.live_trading_enabled:
+            logger.warning(
+                "📄 PAPER TRADING MODE — nessun ordine reale. "
+                "Imposta live_trading_enabled: true in config.yaml per il live."
+            )
 
     @classmethod
     def load(cls) -> "BotSettings":

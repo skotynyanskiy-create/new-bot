@@ -15,10 +15,11 @@ import logging
 import signal
 import sys
 import time
+from collections import deque
 from decimal import Decimal
 from typing import Optional
 
-from src.bot import LokyBot, _start_prometheus_server
+from src.bot import BotState, LokyBot, _start_prometheus_server
 from src.config import config
 from src.core.account_risk import AccountRiskManager
 from src.core.portfolio_risk import PortfolioRiskManager
@@ -50,6 +51,11 @@ class FuturesOrchestrator:
         self._start_time = time.time()
         self._last_candle_time = time.time()   # per dead-man switch
 
+        # BTC crash protection
+        self._crisis_mode = False
+        self._crisis_until: float = 0.0  # timestamp fino a cui resta attivo
+        self._btc_prices: deque[Decimal] = deque(maxlen=8)  # ultimi 8 close BTC (2h su 15m)
+
         # Capital per-symbol
         capital_per_symbol = capital / Decimal(len(symbols))
 
@@ -70,7 +76,7 @@ class FuturesOrchestrator:
 
         # Risk manager account-level (condiviso tra tutti i bot)
         self._account_risk = AccountRiskManager(
-            max_daily_loss_account=config.max_daily_loss * Decimal(len(self.symbols)),
+            max_daily_loss_pct=config.max_daily_loss_pct,
             max_concurrent_positions=config.max_concurrent_positions,
             max_peak_drawdown_pct=getattr(config, 'max_peak_drawdown_pct', Decimal('0.15')),
             initial_capital=capital,
@@ -98,6 +104,8 @@ class FuturesOrchestrator:
         # Bot e state manager per ogni symbol
         self._bots: dict[str, LokyBot] = {}
         self._state_managers: list[StateManager] = []
+        # Lock per-symbol: serializza elaborazione candle per evitare race condition
+        self._candle_locks: dict[str, asyncio.Lock] = {s: asyncio.Lock() for s in self.symbols}
 
         for sym in self.symbols:
             sm  = StateManager(db_path=f"data/state_{sym}.db")
@@ -114,6 +122,14 @@ class FuturesOrchestrator:
             self._bots[sym]          = bot
             self._state_managers.append(sm)
             logger.info("[Loky] Bot inizializzato: %s (capitale=%.2f USDT)", sym, capital_per_symbol)
+
+        # Pre-warm correlazione: registra rendimenti zero per inizializzare la window.
+        # Con rendimenti zero, rolling_correlation() ritorna None (dati insufficienti
+        # per calcolo significativo) → fallback sicuro a gruppi statici.
+        # I dati reali sostituiranno questi entro le prime 20 candle live.
+        for _ in range(25):
+            for sym in self.symbols:
+                self._portfolio_risk.record_return(sym, 0.0)
 
         # Collega callback fill
         self._exec_gw.set_on_order_update_callback(self._route_order_update)
@@ -138,9 +154,79 @@ class FuturesOrchestrator:
 
     async def _route_candle(self, symbol: str, candle: Candle) -> None:
         self._last_candle_time = time.time()   # aggiorna dead-man switch
+
+        # BTC crash protection: traccia prezzo BTC e detecta crash
+        if symbol == "BTCUSDT" and candle.timeframe == config.primary_timeframe:
+            self._btc_prices.append(candle.close)
+            await self._check_btc_crash(candle)
+
+        # Crisis mode: setta flag sui bot altcoin per bloccare SOLO nuove entry
+        # ma permettere gestione TP/SL/trailing sulle posizioni aperte
+        if self._crisis_mode and time.time() < self._crisis_until:
+            for sym, b in self._bots.items():
+                if sym != "BTCUSDT":
+                    b._crisis_block_entry = True
+        elif self._crisis_mode and time.time() >= self._crisis_until:
+            self._crisis_mode = False
+            for b in self._bots.values():
+                b._crisis_block_entry = False
+            logger.info("BTC crash protection: crisis mode disattivato, trading riprende.")
+            self._fire_and_forget(self._notifier.info("🟢 Crisis mode terminato. Trading riprende."))
+
         bot = self._bots.get(symbol)
         if bot:
-            await bot.on_candle(candle)
+            # Lock per-symbol: serializza elaborazione candle per evitare
+            # che due candle dello stesso symbol vengano processate in parallelo
+            lock = self._candle_locks.get(symbol)
+            if lock:
+                async with lock:
+                    await bot.on_candle(candle)
+            else:
+                await bot.on_candle(candle)
+
+            # Aggiorna PnL non realizzato nell'account risk manager
+            total_unrealized = sum(b.unrealized_pnl for b in self._bots.values())
+            self._account_risk.update_unrealized_pnl(total_unrealized)
+
+            # Adatta il daily stop alla volatilità corrente (via ATR percentile)
+            try:
+                atr = bot._indicators.atr()
+                self._portfolio_risk.record_atr(atr)
+                vol_factor = self._portfolio_risk.atr_percentile(atr)
+                self._account_risk.adjust_daily_stop_for_volatility(vol_factor)
+            except (ValueError, AttributeError):
+                pass  # indicatori non ancora pronti
+
+            # Registra rendimento log per correlazione dinamica rolling
+            if candle.timeframe == config.primary_timeframe and len(bot._candles) >= 2:
+                import math as _math
+                prev = bot._candles[-2].close
+                if prev > 0:
+                    log_ret = _math.log(float(candle.close / prev))
+                    self._portfolio_risk.record_return(symbol, log_ret)
+
+    async def _check_btc_crash(self, candle: Candle) -> None:
+        """Detecta crash BTC (>3% drop in 4 candle = 1h su 15m) e attiva crisis mode."""
+        if self._crisis_mode:
+            return
+        if len(self._btc_prices) < 4:
+            return
+        price_4_candles_ago = self._btc_prices[-4]
+        if price_4_candles_ago <= 0:
+            return
+        drop_pct = (price_4_candles_ago - candle.close) / price_4_candles_ago
+        if drop_pct > Decimal('0.03'):  # >3% drop in 1h
+            self._crisis_mode = True
+            self._crisis_until = time.time() + 1800  # 30 minuti
+            logger.warning(
+                "BTC CRASH PROTECTION: BTC -%.1f%% in 1h. Crisis mode per 30min.",
+                float(drop_pct * 100),
+            )
+            self._fire_and_forget(self._notifier.info(
+                f"🚨 <b>BTC CRASH PROTECTION</b>\n"
+                f"BTC -{float(drop_pct * 100):.1f}% in 1h.\n"
+                f"Altcoin entry bloccate per 30 minuti."
+            ))
 
     async def _route_order_update(self, order) -> None:
         bot = self._bots.get(order.symbol)
@@ -227,8 +313,11 @@ class FuturesOrchestrator:
 
         # Telegram: polling comandi + daily summary
         if hasattr(self._notifier, 'start_command_polling'):
-            # Inietta callback per /status
+            # Inietta callback per comandi Telegram
             self._notifier.set_status_callback(self._status_text)
+            self._notifier.set_equity_callback(self._equity_text)
+            self._notifier.set_drawdown_callback(self._drawdown_text)
+            self._notifier.set_strategy_callback(self._strategy_text)
             self._tasks.append(asyncio.create_task(
                 self._notifier.start_command_polling(), name="tg_commands"
             ))
@@ -415,6 +504,55 @@ class FuturesOrchestrator:
             f"Posizioni: {', '.join(positions)}\n"
             f"Engines  : {attr_lines}"
         )
+
+    async def _equity_text(self) -> str:
+        """Genera testo equity per /equity."""
+        total_pnl = sum(bot.realized_pnl for bot in self._bots.values())
+        unrealized = sum(bot.unrealized_pnl for bot in self._bots.values())
+        equity = self._capital + total_pnl
+        lines = [
+            f"Capitale iniziale: {float(self._capital):.2f} USDT",
+            f"Equity corrente : {float(equity):.2f} USDT",
+            f"PnL realizzato  : {float(total_pnl):+.4f} USDT",
+            f"PnL non realiz. : {float(unrealized):+.4f} USDT",
+            f"Return          : {float(total_pnl / self._capital * 100):+.2f}%",
+        ]
+        # Per-symbol breakdown
+        for sym, bot in self._bots.items():
+            lines.append(f"  {sym}: {float(bot.realized_pnl):+.4f} USDT")
+        return "\n".join(lines)
+
+    async def _drawdown_text(self) -> str:
+        """Genera testo drawdown per /drawdown."""
+        dd_pct = self._account_risk.current_drawdown_pct
+        daily_pnl = self._account_risk.daily_pnl
+        peak_active = self._account_risk.peak_drawdown_active
+        return (
+            f"Drawdown corrente: {float(dd_pct * 100):.1f}%\n"
+            f"PnL giornaliero : {float(daily_pnl):+.4f} USDT\n"
+            f"Peak DD stop    : {'🔴 ATTIVO' if peak_active else '🟢 OK'}\n"
+            f"Daily stop      : {'🔴 ATTIVO' if self._account_risk._stop_triggered else '🟢 OK'}"
+        )
+
+    async def _strategy_text(self) -> str:
+        """Genera testo per /strategy — performance per engine."""
+        from collections import defaultdict
+        pnl_map: dict[str, float] = defaultdict(float)
+        trades_map: dict[str, int] = defaultdict(int)
+        for bot in self._bots.values():
+            for strat, pnl in bot.pnl_by_strategy.items():
+                pnl_map[strat] += float(pnl)
+            for strat, cnt in bot.trades_by_strategy.items():
+                trades_map[strat] += cnt
+        if not pnl_map:
+            return "Nessun trade eseguito."
+        lines = []
+        for strat in sorted(pnl_map.keys()):
+            pnl = pnl_map[strat]
+            trades = trades_map.get(strat, 0)
+            icon = "✅" if pnl > 0 else "❌"
+            lines.append(f"{icon} {strat}: {pnl:+.2f} USDT ({trades} trade)")
+        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

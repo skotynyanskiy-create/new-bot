@@ -29,6 +29,7 @@ import aiohttp
 from src.config import BotSettings
 from src.models import Candle, Signal, SignalType
 from src.strategy.indicator_engine import IndicatorEngine
+from src.strategy.sizing import calc_risk_size
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +75,13 @@ class FundingRateEngine:
     async def detect(self, candles: deque[Candle]) -> Signal:
         """
         Recupera il funding rate corrente e genera segnale se sopra/sotto threshold.
+        In paper/backtest mode, skip HTTP call (no funding rate data disponibile).
         """
         if not self._indicators.ready():
+            return self._no_signal(candles[-1] if candles else None)
+
+        # Skip HTTP in paper/backtest: funding rate non disponibile senza API live
+        if not self._top_cfg.live_trading_enabled:
             return self._no_signal(candles[-1] if candles else None)
 
         candle = candles[-1]
@@ -95,15 +101,30 @@ class FundingRateEngine:
         entry = candle.close
         sl_distance = Decimal('0.5') * atr_val
 
+        # TP a 1.0×ATR, SL a 0.8×ATR → R:R 1.25:1 (ragionevole per funding harvest).
+        # Il profitto principale viene dal funding stesso, il TP è un bonus.
+        # Score proporzionale al funding rate: rate più alto = segnale più forte.
+        tp_distance = Decimal('1.0') * atr_val
+        sl_distance = Decimal('0.8') * atr_val
+
+        # Score dinamico: funding rate più alto → più affidabile
+        abs_rate = abs(funding_rate)
+        if abs_rate > threshold * 3:
+            score = Decimal('85')   # funding estremo
+        elif abs_rate > threshold * 2:
+            score = Decimal('80')
+        else:
+            score = Decimal('72')   # appena sopra threshold
+
         # funding positivo → SHORT (long pagano short)
         if funding_rate > threshold:
-            tp   = entry - Decimal('0.3') * atr_val   # obiettivo conservativo
+            tp   = entry - tp_distance
             sl   = entry + sl_distance
             size = self._calc_size(sl_distance, entry, fraction=Decimal('0.5'))
             if size > _ZERO:
                 logger.info(
-                    "SHORT funding-harvest %s | rate=%.4f%% tp=%.4f sl=%.4f",
-                    candle.symbol, float(funding_rate * 100), tp, sl,
+                    "SHORT funding-harvest %s | rate=%.4f%% tp=%.4f sl=%.4f score=%.0f",
+                    candle.symbol, float(funding_rate * 100), tp, sl, score,
                 )
                 return Signal(
                     symbol=candle.symbol,
@@ -114,19 +135,19 @@ class FundingRateEngine:
                     size=size,
                     atr=atr_val,
                     timestamp=time.time(),
-                    score=Decimal('80'),
+                    score=score,
                     strategy_name="funding_rate",
                 )
 
         # funding negativo → LONG (short pagano long)
         if funding_rate < -threshold:
-            tp   = entry + Decimal('0.3') * atr_val
+            tp   = entry + tp_distance
             sl   = entry - sl_distance
             size = self._calc_size(sl_distance, entry, fraction=Decimal('0.5'))
             if size > _ZERO:
                 logger.info(
-                    "LONG funding-harvest %s | rate=%.4f%% tp=%.4f sl=%.4f",
-                    candle.symbol, float(funding_rate * 100), tp, sl,
+                    "LONG funding-harvest %s | rate=%.4f%% tp=%.4f sl=%.4f score=%.0f",
+                    candle.symbol, float(funding_rate * 100), tp, sl, score,
                 )
                 return Signal(
                     symbol=candle.symbol,
@@ -137,7 +158,7 @@ class FundingRateEngine:
                     size=size,
                     atr=atr_val,
                     timestamp=time.time(),
-                    score=Decimal('80'),
+                    score=score,
                     strategy_name="funding_rate",
                 )
 
@@ -193,18 +214,10 @@ class FundingRateEngine:
     def _calc_size(
         self, sl_distance: Decimal, price: Decimal, fraction: Decimal = Decimal('1')
     ) -> Decimal:
-        risk_usdt = self._capital * self._top_cfg.risk_per_trade_pct * fraction
-        if sl_distance == _ZERO or price == _ZERO:
-            return _ZERO
-
-        raw_size     = risk_usdt / sl_distance
-        max_notional = self._capital * Decimal(str(self._top_cfg.leverage))
-        max_size     = max_notional / price
-        size         = min(raw_size, max_size).quantize(Decimal('0.001'))
-
-        if size * price < _MIN_NOTIONAL:
-            return _ZERO
-        return size
+        return calc_risk_size(
+            self._capital, self._top_cfg.risk_per_trade_pct,
+            sl_distance, self._top_cfg.leverage, price, fraction=fraction,
+        )
 
     @staticmethod
     def _no_signal(candle: Candle | None) -> Signal:

@@ -25,7 +25,7 @@ class AccountRiskManager:
     Singleton condiviso tra tutti i bot dello stesso orchestratore.
 
     Args:
-        max_daily_loss_account   — perdita USDT giornaliera massima sull'intero conto
+        max_daily_loss_pct       — perdita giornaliera massima come % del capitale (es. 0.05 = 5%)
         max_concurrent_positions — numero massimo di posizioni aperte in contemporanea
         max_peak_drawdown_pct    — drawdown massimo dal picco equity (es. 0.15 = 15%)
         initial_capital          — capitale iniziale per calcolo drawdown (USDT)
@@ -33,16 +33,19 @@ class AccountRiskManager:
 
     def __init__(
         self,
-        max_daily_loss_account: Decimal = Decimal("-50"),
+        max_daily_loss_pct: Decimal = Decimal("0.05"),
         max_concurrent_positions: int = 2,
         max_peak_drawdown_pct: Decimal = Decimal("0.15"),
         initial_capital: Decimal = Decimal("500"),
     ) -> None:
-        self._max_daily_loss    = max_daily_loss_account
+        self._max_daily_loss_pct = max_daily_loss_pct
+        self._base_daily_loss   = -(initial_capital * max_daily_loss_pct)  # base dal capitale
+        self._max_daily_loss    = self._base_daily_loss                    # attivo (adattivo)
         self._max_concurrent    = max_concurrent_positions
         self._max_dd_pct        = max_peak_drawdown_pct
         self._realized_pnl_day: Decimal = _ZERO
         self._realized_pnl_total: Decimal = _ZERO      # cumulativo dall'avvio
+        self._unrealized_pnl: Decimal = _ZERO           # PnL non realizzato posizioni aperte
         self._equity_peak: Decimal = initial_capital   # picco equity per drawdown
         self._initial_capital: Decimal = initial_capital
         self._open_symbols: Set[str]    = set()
@@ -59,11 +62,43 @@ class AccountRiskManager:
     # API pubblica
     # ------------------------------------------------------------------
 
+    def update_unrealized_pnl(self, unrealized: Decimal) -> None:
+        """
+        Aggiorna il PnL non realizzato delle posizioni aperte.
+        Chiamato periodicamente dall'orchestratore o dai bot.
+        """
+        self._unrealized_pnl = unrealized
+
+    def adjust_daily_stop_for_volatility(self, vol_factor: Decimal) -> None:
+        """
+        Adatta il daily stop alla volatilità corrente del mercato.
+
+        vol_factor = ATR_percentile (0-1):
+          > 0.70 (alta vol)  → stringe il daily stop (×0.7)
+          0.30-0.70 (media)  → daily stop invariato (×1.0)
+          < 0.30 (bassa vol) → allarga il daily stop (×1.3)
+
+        Questo evita di bruciare il daily stop in mercati molto volatili
+        e permette più spazio in mercati tranquilli.
+        """
+        if vol_factor > Decimal('0.70'):
+            multiplier = Decimal('0.7')
+        elif vol_factor < Decimal('0.30'):
+            multiplier = Decimal('1.3')
+        else:
+            multiplier = Decimal('1.0')
+
+        self._max_daily_loss = self._base_daily_loss * multiplier
+        logger.debug(
+            "Daily stop adattivo: vol_factor=%.2f → multiplier=%.1f → limit=%.2f USDT",
+            float(vol_factor), float(multiplier), float(self._max_daily_loss),
+        )
+
     def can_open_position(self, symbol: str) -> bool:
         """
         Ritorna True se il bot può aprire una nuova posizione.
         Nega se:
-          • daily loss account-level è raggiunto
+          • daily loss account-level è raggiunto (realizzato + non realizzato)
           • drawdown dal picco equity supera max_peak_drawdown_pct
           • numero posizioni aperte >= max_concurrent
         """
@@ -75,6 +110,17 @@ class AccountRiskManager:
 
         if self._drawdown_stop:
             logger.warning("Peak drawdown stop attivo. Nessuna nuova posizione consentita.")
+            return False
+
+        # Controlla PnL giornaliero includendo perdite non realizzate
+        total_daily = self._realized_pnl_day + self._unrealized_pnl
+        if total_daily <= self._max_daily_loss and not self._stop_triggered:
+            logger.warning(
+                "ACCOUNT DAILY STOP (unrealized): PnL giorno=%.4f USDT "
+                "(realized=%.4f + unrealized=%.4f, limite=%.4f).",
+                total_daily, self._realized_pnl_day, self._unrealized_pnl, self._max_daily_loss,
+            )
+            self._stop_triggered = True
             return False
 
         if len(self._open_symbols) >= self._max_concurrent:
@@ -167,11 +213,12 @@ class AccountRiskManager:
                 "Reset daily PnL (era %.4f USDT). Nuovo giorno UTC.",
                 self._realized_pnl_day,
             )
+            # Reset pulito: nessun carry-over di unrealized per evitare double-counting.
+            # Il check can_open_position() include già unrealized in real-time (riga 116),
+            # quindi le perdite aperte sono protette SENZA duplicarle nel realized.
             self._realized_pnl_day = _ZERO
             self._stop_triggered   = False
-            # Il peak drawdown stop NON viene resettato giornalmente:
-            # protegge il capitale dall'inizio della sessione, non si azzera mai da solo.
-            # (L'operatore deve riavviare il bot dopo aver valutato la situazione.)
+            # Il peak drawdown stop NON viene resettato giornalmente.
             self._day_start        = now_day
 
     @staticmethod

@@ -16,6 +16,7 @@ Feature:
 """
 
 import asyncio
+import datetime
 import logging
 import time
 from collections import deque
@@ -32,6 +33,7 @@ except ImportError:
 from src.config import BotSettings
 from src.core.account_risk import AccountRiskManager
 from src.core.kelly_sizing import KellySizer
+from src.core.liquidation_monitor import LiquidationAlert, LiquidationMonitor
 from src.core.portfolio_risk import PortfolioRiskManager
 from src.models import Candle, Order, OrderStatus, Side, Signal, SignalType, TPLevel, Trade
 from src.notifications.telegram import TelegramNotifier
@@ -41,7 +43,10 @@ from src.strategy.funding_rate_engine import FundingRateEngine
 from src.strategy.indicator_engine import IndicatorEngine
 from src.strategy.market_sentiment_engine import MarketSentimentEngine
 from src.strategy.mean_reversion_engine import MeanReversionEngine
+from src.gateways.smart_execution import SlippageEstimator
+from src.strategy.orderflow_engine import OrderFlowEngine
 from src.strategy.signal_aggregator import SignalAggregator
+from src.strategy.volatility_engine import VolatilityRegime, VolatilityRegimeEngine
 from src.strategy.trend_following_engine import TrendFollowingEngine
 
 logger = logging.getLogger(__name__)
@@ -163,21 +168,40 @@ class LokyBot:
         self._mean_rev      = MeanReversionEngine(config, self._indicators, capital)
         self._trend_follow  = TrendFollowingEngine(config, self._indicators, capital)
         self._funding_rate  = FundingRateEngine(config, self._indicators, capital, testnet=config.testnet)
-        self._sentiment     = MarketSentimentEngine(testnet=config.testnet)
+        self._sentiment     = MarketSentimentEngine(
+            testnet=config.testnet, live_trading=config.live_trading_enabled,
+        )
 
         # --- Signal scoring ---
-        self._aggregator = SignalAggregator(self._indicators, self._htf_indicators)
+        self._aggregator = SignalAggregator(
+            self._indicators, self._htf_indicators, self._macro_indicators
+        )
 
+        # --- Volatility regime ---
+        self._vol_engine = VolatilityRegimeEngine(self._indicators)
+
+        # --- Order flow ---
+        self._orderflow = OrderFlowEngine()
+
+        # --- Smart execution ---
+        self._slippage_est = SlippageEstimator(
+            base_slippage_pct=config.slippage_pct,
+        )
         # --- Kelly Criterion sizing ---
         self._kelly = KellySizer(
             history_trades = config.kelly_min_trades,
-            half_kelly     = True,
+            kelly_divisor  = 2,           # half-Kelly (configurabile: 1=full, 3=third, 4=quarter)
             min_fraction   = Decimal('0.005'),
             max_fraction   = Decimal('0.03'),
+            use_optimal_f  = True,        # Optimal-f per fat tails crypto
         )
+
+        # --- Liquidation monitor ---
+        self._liq_monitor = LiquidationMonitor(leverage=config.leverage)
 
         self._candles: deque[Candle] = deque(maxlen=200)
         self._candle_count: int = 0       # contatore candle per polling funding rate
+        self._last_price: Decimal = _ZERO  # ultimo prezzo (close dell'ultima candle)
 
         # --- Macchina a stati ---
         self._state: BotState               = BotState.FLAT
@@ -194,6 +218,7 @@ class LokyBot:
         # --- Partial TP ---
         self._tp_levels: list[TPLevel] = []
         self._accumulated_trade_pnl: Decimal = _ZERO  # PnL totale del trade (somma dei parziali)
+        self._partial_locked_pnl: Decimal = _ZERO     # PnL locked da partial exits (per Kelly)
 
         # --- Pyramid (scaling-in) ---
         self._scale_in_count: int = 0    # numero di add-on effettuati (max 1)
@@ -211,6 +236,8 @@ class LokyBot:
 
         # --- Flag e controlli ---
         self._daily_stop_triggered: bool = False
+        self._crisis_block_entry: bool = False  # settato dall'orchestratore in crisis mode
+        self._tp_adjusted: bool = False  # dynamic TP: una sola modifica per trade
         self._cooldown_remaining: int    = 0
         self._pending_signal: Optional[Signal] = None
 
@@ -259,6 +286,9 @@ class LokyBot:
         self._candles.append(candle)
         self._indicators.update(candle)
         self._candle_count += 1
+        self._last_price = candle.close
+        self._vol_engine.update()   # aggiorna volatility regime
+        self._orderflow.update(candle)  # aggiorna order flow
 
         # Registra ATR per leva dinamica
         if self._portfolio_risk is not None:
@@ -267,11 +297,79 @@ class LokyBot:
             except ValueError:
                 pass
 
-        # Posizione aperta: trailing SL + controllo partial TP/SL + pyramid scaling-in
+        # Posizione aperta: liquidation check + trailing SL + partial TP/SL + scaling-in
         if self._state in (BotState.POSITION_OPEN, BotState.PARTIAL_EXIT):
+            # Liquidation monitor: chiudi se margine critico
+            is_long = self._position_side == Side.BUY
+            liq_alert = self._liq_monitor.check(
+                self._entry_price, candle.close, is_long, symbol=self.symbol,
+            )
+            if liq_alert == LiquidationAlert.CRITICAL:
+                logger.warning(
+                    "%s LIQUIDATION CRITICAL — chiusura emergenza a mercato.", self.symbol,
+                )
+                if self._notifier:
+                    self._fire_and_forget(self._notifier.info(
+                        f"🚨 <b>LIQUIDAZIONE IMMINENTE</b> {self.symbol} — "
+                        f"chiusura forzata a mercato."
+                    ))
+                await self._close_remaining(candle.close, "liquidation_critical")
+                return
+
+            # Gap protection: se la perdita supera 2x lo SL originale, chiudi forzatamente.
+            # Protegge da gap di prezzo e slippage estremo che oltrepassano lo SL.
+            if self._sl_price_orig > _ZERO and self._position_size > _ZERO:
+                sl_distance_orig = abs(self._entry_price - self._sl_price_orig)
+                if is_long:
+                    actual_loss_distance = self._entry_price - candle.close
+                else:
+                    actual_loss_distance = candle.close - self._entry_price
+                if actual_loss_distance > sl_distance_orig * Decimal('2'):
+                    logger.warning(
+                        "%s GAP PROTECTION — perdita %.4f > 2x SL originale %.4f. Chiusura forzata.",
+                        self.symbol, actual_loss_distance, sl_distance_orig,
+                    )
+                    if self._notifier:
+                        self._fire_and_forget(self._notifier.info(
+                            f"⚠️ <b>GAP PROTECTION</b> {self.symbol} — "
+                            f"perdita > 2x SL. Chiusura forzata."
+                        ))
+                    await self._close_remaining(candle.close, "gap_protection_2x_sl")
+                    return
+
+            # Dynamic TP: estendi target se in forte profitto, stringi se in difficoltà
+            self._update_dynamic_tp(candle)
+
             if not self._cfg.live_trading_enabled:
                 self._update_trailing_sl(candle)
                 await self._check_paper_tp_sl(candle)
+            # MACD divergence exit: se MACD diverge, chiudi anticipatamente (post-TP1)
+            if self._tp_levels and self._tp_levels[0].hit:
+                try:
+                    if is_long and self._indicators.macd_bearish_divergence():
+                        logger.info("%s MACD bearish divergence — exit anticipato", self.symbol)
+                        await self._close_remaining(candle.close, "macd_divergence")
+                        return
+                    if not is_long and self._indicators.macd_bullish_divergence():
+                        logger.info("%s MACD bullish divergence — exit anticipato", self.symbol)
+                        await self._close_remaining(candle.close, "macd_divergence")
+                        return
+                except ValueError:
+                    pass
+
+            # Order Flow divergence exit: se CVD diverge dal prezzo, chiudi anticipatamente
+            if self._tp_levels and self._tp_levels[0].hit:
+                price_rising = candle.close > self._entry_price if is_long else candle.close < self._entry_price
+                div = self._orderflow.divergence_signal(price_rising)
+                if div == "bearish_divergence" and is_long:
+                    logger.info("%s Order Flow bearish divergence — exit anticipato", self.symbol)
+                    await self._close_remaining(candle.close, "orderflow_divergence")
+                    return
+                if div == "bullish_divergence" and not is_long:
+                    logger.info("%s Order Flow bullish divergence — exit anticipato", self.symbol)
+                    await self._close_remaining(candle.close, "orderflow_divergence")
+                    return
+
             # Scaling-in: valuta add-on anche in live (solo POSITION_OPEN, non PARTIAL_EXIT)
             if self._state == BotState.POSITION_OPEN:
                 await self._check_scale_in(candle)
@@ -284,121 +382,65 @@ class LokyBot:
             # Gap validation: se il prezzo di apertura è troppo lontano dall'entry previsto,
             # scarta il segnale (il mercato è gappato, il setup non è più valido)
             gap = abs(candle.open - sig.entry_price)
-            max_gap = sig.atr * Decimal('2') if sig.atr > _ZERO else sig.entry_price * Decimal('0.02')
+            max_gap = sig.atr if sig.atr > _ZERO else sig.entry_price * Decimal('0.01')
             if gap > max_gap:
                 logger.info(
-                    "%s Next-candle entry scartata: gap %.4f > max %.4f (2×ATR). "
-                    "Open=%.4f vs signal entry=%.4f",
-                    self.symbol, gap, max_gap, candle.open, sig.entry_price,
+                    "%s Next-candle entry scartata: gap %.4f > 1×ATR %.4f.",
+                    self.symbol, gap, max_gap,
                 )
                 return
+            # Recalcola TP/SL relativi al prezzo di entry reale (candle.open)
+            # per mantenere lo stesso R:R del segnale originale
+            price_shift = candle.open - sig.entry_price
+            sig.take_profit += price_shift
+            sig.stop_loss += price_shift
+            sig.entry_price = candle.open
             await self._enter_position(sig, fill_price_override=candle.open)
             return
 
         if self._state != BotState.FLAT:
             return
 
-        # Cooldown post-loss
-        if self._cooldown_remaining > 0:
-            self._cooldown_remaining -= 1
-            logger.debug("%s Cooldown: %d candele rimaste.", self.symbol, self._cooldown_remaining)
-            return
-
-        # Circuit breaker: pausa dopo N perdite consecutive
-        if self._circuit_breaker_candles > 0:
-            self._circuit_breaker_candles -= 1
-            if self._circuit_breaker_candles == 0:
-                logger.info(
-                    "%s Circuit breaker SCADUTO — trading ripreso.",
-                    self.symbol,
-                )
-                if self._notifier:
-                    self._fire_and_forget(self._notifier.info(
-                        f"✅ Circuit breaker {self.symbol} scaduto — trading ripreso."
-                    ))
-            else:
-                logger.debug(
-                    "%s Circuit breaker attivo: %d candle rimaste.",
-                    self.symbol, self._circuit_breaker_candles,
-                )
-            return
-
-        if self._is_daily_stop_active():
+        # All entry pre-checks (extracted for clarity)
+        if not self._check_entry_allowed(candle):
             return
 
         # --- Detect regime e raccoglie segnali ---
         signals = self._collect_signals()
 
-        # Funding rate engine: sondaggio ogni 4 candle
+        # Async engines: parallelizza funding + sentiment (evita serial HTTP)
+        async_tasks = []
         if self._candle_count % 4 == 0:
-            funding_sig = await self._collect_funding_signal()
-            if funding_sig is not None:
-                signals.append(funding_sig)
-
-        # Market sentiment: aggiorna OI + L/S ratio ogni 8 candle
+            async_tasks.append(self._collect_funding_signal())
         if self._candle_count % 8 == 0:
-            await self._update_sentiment(candle)
+            async_tasks.append(self._update_sentiment(candle))
+        if async_tasks:
+            results = await asyncio.gather(*async_tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.debug("%s Async signal error (ignorato): %s", self.symbol, r)
+                    continue
+                if isinstance(r, Signal) and r.signal_type != SignalType.NONE:
+                    signals.append(r)
 
         if not signals:
             return
+
+        # Volatility contraction filter: solo trend_following con score alto
+        if hasattr(self, '_current_vol_regime') and self._current_vol_regime == VolatilityRegime.CONTRACTION:
+            signals = [s for s in signals if s.strategy_name == "trend_following" and s.score >= Decimal('75')]
+            if not signals:
+                logger.debug("%s Contraction regime: no high-confidence TF signals, skip.", self.symbol)
+                return
 
         # Seleziona il miglior segnale con scoring
         best = self._aggregator.select_best(signals)
         if best is None:
             return
 
-        # --- Filtro sentiment (OI + L/S ratio) ---
-        # 1. Blocco esplicito basato su flag block_long/block_short (contrarian estremo)
-        if self._sentiment.is_blocked(self.symbol, best.signal_type):
-            logger.info(
-                "%s Segnale %s bloccato da sentiment (retail overextended).",
-                self.symbol, best.signal_type.name,
-            )
+        # Apply score/size modifiers + filters (extracted for clarity)
+        if not self._apply_signal_modifiers(best):
             return
-        # 2. Aggiustamento score basato su OI delta e ratio (±15 punti)
-        sent_adj = self._sentiment.score_adjustment_for(self.symbol, best.signal_type)
-        if sent_adj != 0:
-            old_score = best.score
-            best.score = max(_ZERO, best.score + Decimal(str(sent_adj)))
-            logger.debug(
-                "%s Sentiment adjustment: %+d punti (%s) score %.0f→%.0f",
-                self.symbol, sent_adj, best.signal_type.name, old_score, best.score,
-            )
-
-        # --- Filtro macro trend (4h) ---
-        if not self._macro_trend_aligned(best.signal_type):
-            logger.debug(
-                "%s Segnale %s (%s) scartato: trend 4h non allineato.",
-                self.symbol, best.signal_type.name, best.strategy_name,
-            )
-            return
-
-        # --- Filtro multi-timeframe (1h) ---
-        if not self._htf_trend_aligned(best.signal_type):
-            logger.debug(
-                "%s Segnale %s (%s) scartato: trend 1h non allineato.",
-                self.symbol, best.signal_type.name, best.strategy_name,
-            )
-            return
-
-        # Score minimo dopo tutti gli aggiustamenti
-        if best.score < self._cfg.strategy.min_signal_score:
-            logger.debug(
-                "%s Segnale %s score insufficiente post-sentiment: %.0f < %.0f",
-                self.symbol, best.signal_type.name, best.score, self._cfg.strategy.min_signal_score,
-            )
-            return
-
-        # --- Portfolio risk check ---
-        if self._portfolio_risk is not None:
-            notional = best.entry_price * best.size
-            ok, reason = self._portfolio_risk.can_open(self.symbol, notional)
-            if not ok:
-                logger.info("%s Segnale bloccato da PortfolioRisk: %s", self.symbol, reason)
-                return
-
-        # --- Anti-martingale: aggiusta size in base al streak ---
-        best.size = self._apply_streak_sizing(best.size)
 
         if _prom:
             _signals_total.labels(symbol=self.symbol, direction=best.signal_type.name).inc()
@@ -412,6 +454,118 @@ class LokyBot:
             self._pending_signal = best
         else:
             await self._enter_position(best)
+
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Score/Size Modifiers + Trend Filters (extracted from on_candle)
+    # ------------------------------------------------------------------
+
+    def _check_entry_allowed(self, candle: Candle) -> bool:
+        """
+        Verifica tutte le pre-condizioni per generare segnali di entry.
+        Returns True se il bot può cercare segnali, False se bloccato.
+        Gestisce: crisis mode, CHOPPY, cooldown, circuit breaker, daily stop,
+        time-of-day, volatility regime, gap protection.
+        """
+        if self._crisis_block_entry:
+            return False
+        if self._aggregator.is_choppy_market():
+            return False
+
+        if self._cooldown_remaining > 0:
+            self._cooldown_remaining -= 1
+            return False
+
+        if self._circuit_breaker_candles > 0:
+            self._circuit_breaker_candles -= 1
+            if self._circuit_breaker_candles == 0:
+                logger.info("%s Circuit breaker SCADUTO — trading ripreso.", self.symbol)
+                if self._notifier:
+                    self._fire_and_forget(self._notifier.info(
+                        f"✅ Circuit breaker {self.symbol} scaduto — trading ripreso."
+                    ))
+            return False
+
+        if self._is_daily_stop_active():
+            return False
+
+        utc_hour = datetime.datetime.utcnow().hour
+        if utc_hour in (21, 22, 23, 4):
+            return False
+
+        # Volatility regime + gap protection
+        vol_regime = self._vol_engine.detect()
+        self._current_vol_regime = vol_regime
+        if len(self._candles) >= 2:
+            try:
+                atr = self._indicators.atr()
+                prev_close = self._candles[-2].close
+                gap = abs(candle.open - prev_close)
+                if gap > atr * Decimal('2'):
+                    return False
+            except ValueError:
+                pass
+
+        return True
+
+    def _apply_signal_modifiers(self, best: Signal) -> bool:
+        """
+        Applica tutti i modifier a score e size del segnale selezionato.
+        Verifica trend filters (macro + HTF) e score minimo.
+
+        Returns True se il segnale è valido per l'entry, False se scartato.
+        """
+        pre_size = best.size
+
+        # --- Score modifiers ---
+        vol_mod = self._vol_engine.score_modifier()
+        if vol_mod != Decimal('1'):
+            best.score = min(best.score * vol_mod, Decimal('100')).quantize(Decimal('0.1'))
+
+        is_long = best.signal_type == SignalType.LONG
+        of_mod = self._orderflow.score_modifier(is_long)
+        if of_mod != Decimal('1'):
+            best.score = min(best.score * of_mod, Decimal('100')).quantize(Decimal('0.1'))
+            best.size = (best.size * of_mod).quantize(Decimal('0.001'))
+
+        # --- Sentiment ---
+        if self._sentiment.is_blocked(self.symbol, best.signal_type):
+            logger.info("%s Segnale %s bloccato da sentiment.", self.symbol, best.signal_type.name)
+            return False
+
+        sent_adj = self._sentiment.score_adjustment_for(self.symbol, best.signal_type)
+        if sent_adj != 0:
+            best.score = max(_ZERO, min(Decimal('100'), best.score + Decimal(str(sent_adj))))
+        if sent_adj > 10:
+            best.size = (best.size * Decimal('1.2')).quantize(Decimal('0.001'))
+        elif sent_adj < -5:
+            best.size = (best.size * Decimal('0.7')).quantize(Decimal('0.001'))
+
+        # --- Trend filters ---
+        if not self._macro_trend_aligned(best.signal_type):
+            return False
+        if not self._htf_trend_aligned(best.signal_type):
+            return False
+
+        # --- Score minimo ---
+        if best.score < self._cfg.strategy.min_signal_score:
+            return False
+
+        # --- Size modifiers ---
+        # Score-adaptive size: alta confidenza → boost, bassa → riduzione
+        if best.score >= Decimal('85'):
+            best.size = (best.size * Decimal('1.15')).quantize(Decimal('0.001'))
+        elif best.score < Decimal('70'):
+            best.size = (best.size * Decimal('0.85')).quantize(Decimal('0.001'))
+
+        best.size = self._apply_streak_sizing(best.size)
+
+        # Cap cumulative modifiers a 40% dell'originale (INCLUDE score boost)
+        min_size = (pre_size * Decimal('0.40')).quantize(Decimal('0.001'))
+        if best.size < min_size and min_size > _ZERO:
+            best.size = min_size
+
+        return True
 
     # ------------------------------------------------------------------
     # Raccolta segnali da tutti gli engine
@@ -459,8 +613,12 @@ class LokyBot:
         """
         Raccoglie il segnale dal FundingRateEngine (async — richiede chiamata REST).
         Chiamato separatamente da on_candle ogni N candle per non rallentare il loop.
+        Rispetta il regime: in CHOPPY nessun trade ammesso, funding incluso.
         """
         if not self._indicators.ready():
+            return None
+        # Regime check: CHOPPY = nessun trade, funding incluso
+        if not self._aggregator.preferred_strategies():
             return None
         try:
             sig = await self._funding_rate.detect(self._candles)
@@ -502,6 +660,16 @@ class LokyBot:
         except ValueError:
             return True
 
+        # Threshold minimo: se spread < 0.2% del prezzo, macro è neutro → blocca
+        if ema_s > _ZERO:
+            spread_pct = abs(ema_f - ema_s) / ema_s
+            if spread_pct < Decimal('0.002'):
+                logger.debug(
+                    "%s Macro trend neutro (spread=%.3f%% < 0.2%%), segnale bloccato.",
+                    self.symbol, float(spread_pct * 100),
+                )
+                return False
+
         if signal_type == SignalType.LONG:
             aligned = ema_f > ema_s
         elif signal_type == SignalType.SHORT:
@@ -521,6 +689,64 @@ class LokyBot:
     # Trailing stop
     # ------------------------------------------------------------------
 
+    def _update_dynamic_tp(self, candle: Candle) -> None:
+        """
+        Adatta i TP levels al momentum — UNA SOLA VOLTA per trade.
+        Previene oscillazione: una volta che TP3 è esteso o stretto, non si cambia più.
+        """
+        if not self._tp_levels or len(self._tp_levels) < 3:
+            return
+        if self._tp_levels[0].hit:
+            return
+        if self._position_side is None or self._entry_price <= _ZERO:
+            return
+        if self._tp_adjusted:
+            return  # Già aggiornato per questo trade, non oscillare
+
+        # Attendi almeno 5 candle dall'entry prima di valutare
+        if self._entry_time > 0:
+            candles_since_entry = (candle.timestamp - self._entry_time) / 900  # 15m candle
+            if candles_since_entry < 5:
+                return
+
+        try:
+            atr = self._indicators.atr()
+        except ValueError:
+            return
+
+        is_long = self._position_side == Side.BUY
+        if is_long:
+            profit_pct = (candle.close - self._entry_price) / self._entry_price
+        else:
+            profit_pct = (self._entry_price - candle.close) / self._entry_price
+
+        # Forte profitto (>2%): estendi TP3 una volta
+        if profit_pct > Decimal('0.02'):
+            if is_long:
+                self._tp_levels[2] = TPLevel(
+                    self._tp_levels[2].price + atr * Decimal('0.5'),
+                    self._tp_levels[2].qty_fraction,
+                )
+            else:
+                self._tp_levels[2] = TPLevel(
+                    self._tp_levels[2].price - atr * Decimal('0.5'),
+                    self._tp_levels[2].qty_fraction,
+                )
+            self._tp_adjusted = True
+
+        # Stagnante (±0.3%): stringi TP2/TP3 una volta
+        elif abs(profit_pct) < Decimal('0.003'):
+            shrink = Decimal('0.85')
+            if is_long:
+                new_tp2 = self._entry_price + (self._tp_levels[1].price - self._entry_price) * shrink
+                new_tp3 = self._entry_price + (self._tp_levels[2].price - self._entry_price) * shrink
+            else:
+                new_tp2 = self._entry_price - (self._entry_price - self._tp_levels[1].price) * shrink
+                new_tp3 = self._entry_price - (self._entry_price - self._tp_levels[2].price) * shrink
+            self._tp_levels[1] = TPLevel(new_tp2, self._tp_levels[1].qty_fraction)
+            self._tp_levels[2] = TPLevel(new_tp3, self._tp_levels[2].qty_fraction)
+            self._tp_adjusted = True
+
     def _update_trailing_sl(self, candle: Candle) -> None:
         """
         Trailing stop adattivo: la distanza del trail si adatta alla volatilità ATR.
@@ -535,6 +761,12 @@ class LokyBot:
         if not self._cfg.strategy.trailing_stop_enabled:
             return
         if self._position_side is None or self._position_size == _ZERO:
+            return
+        # Attiva trail solo DOPO almeno 1 partial TP (TP1 50%).
+        # Prima di TP1, lo SL è fisso e il prezzo deve raggiungere il primo target.
+        # Dopo TP1, lo SL è a breakeven e il trail protegge il residuo.
+        tp1_hit = self._tp_levels and self._tp_levels[0].hit
+        if not tp1_hit:
             return
         try:
             atr = self._indicators.atr()
@@ -595,6 +827,32 @@ class LokyBot:
                 await self._close_remaining(sl_fill, "SL hit (paper)")
                 return
 
+        # --- TTL-based TP scaling: target si stringono col tempo ---
+        # Solo se NESSUN partial TP è già stato hit (altrimenti lascia il TP flow gestire)
+        any_tp_hit = any(tp.hit for tp in self._tp_levels) if self._tp_levels else False
+        if self._entry_time > 0 and not any_tp_hit:
+            hold_seconds = time.time() - self._entry_time
+            max_hold_s = self._cfg.strategy.max_hold_hours * 3600
+            hold_ratio = hold_seconds / max_hold_s if max_hold_s > 0 else 0
+
+            if hold_ratio > 0.66:  # ultimi 33% del tempo
+                try:
+                    atr = self._indicators.atr()
+                    min_profit_to_exit = atr * Decimal('0.5')
+                    if is_long:
+                        profit = candle.close - self._entry_price
+                    else:
+                        profit = self._entry_price - candle.close
+                    if profit > min_profit_to_exit:
+                        logger.info(
+                            "%s TTL exit: hold %.0f%%, profit %.4f > 0.5×ATR. Chiusura.",
+                            self.symbol, hold_ratio * 100, profit,
+                        )
+                        await self._close_remaining(candle.close, "ttl_profit_exit")
+                        return
+                except ValueError:
+                    pass
+
         # --- Partial TP levels ---
         for i, tp_lvl in enumerate(self._tp_levels):
             if tp_lvl.hit:
@@ -616,12 +874,15 @@ class LokyBot:
             await self._close_partial(tp_fill, close_size, f"TP{i+1} (paper)")
             tp_lvl.hit = True
 
-            # Dopo TP1 → SL a breakeven
+            # Dopo TP1 → SL a breakeven + buffer per coprire slippage
+            # Il buffer (0.1% del prezzo) evita che lo slippage paper trasformi
+            # un exit "a breakeven" in una micro-perdita
             if i == 0:
+                slip_buffer = self._entry_price * Decimal('0.001')
                 if is_long:
-                    self._sl_price = max(self._sl_price, self._entry_price)
+                    self._sl_price = max(self._sl_price, self._entry_price + slip_buffer)
                 else:
-                    self._sl_price = min(self._sl_price, self._entry_price)
+                    self._sl_price = min(self._sl_price, self._entry_price - slip_buffer)
                 logger.info("%s SL spostato a breakeven: %.4f", self.symbol, self._sl_price)
 
             if self._position_size <= _ZERO:
@@ -632,7 +893,7 @@ class LokyBot:
     # ------------------------------------------------------------------
 
     def _is_daily_stop_active(self) -> bool:
-        if self.realized_pnl <= self._cfg.max_daily_loss:
+        if self.realized_pnl <= -(self._capital * self._cfg.max_daily_loss_pct):
             if not self._daily_stop_triggered:
                 logger.warning(
                     "%s Daily loss limit raggiunto (%.2f USDT). Trading sospeso.",
@@ -676,7 +937,33 @@ class LokyBot:
         task.add_done_callback(_on_done)
 
     async def close(self) -> None:
-        """Chiude le sessioni HTTP interne e cancella task pending."""
+        """
+        Shutdown graceful: chiude posizioni aperte, persiste stato, cleanup.
+        """
+        # 1. Se posizione aperta, chiudi a mercato (live) o logga warning (paper)
+        if self._position_size > _ZERO and self._position_side is not None:
+            if self._cfg.live_trading_enabled:
+                logger.critical(
+                    "%s SHUTDOWN: posizione aperta %s %.3f — chiusura a mercato.",
+                    self.symbol, self._position_side.name, self._position_size,
+                )
+                try:
+                    await self._exit_position_market("emergency_shutdown")
+                except Exception as e:
+                    logger.error("%s Errore chiusura emergenza: %s", self.symbol, e)
+            else:
+                logger.warning(
+                    "%s SHUTDOWN: posizione aperta %s %.3f (paper — nessun ordine inviato).",
+                    self.symbol, self._position_side.name, self._position_size,
+                )
+
+        # 2. Persisti stato finale (incluso position state per recovery)
+        try:
+            await self._save_state()
+        except Exception as e:
+            logger.error("%s Errore save state finale: %s", self.symbol, e)
+
+        # 3. Cleanup task e sessioni
         for task in self._pending_tasks:
             task.cancel()
         if self._pending_tasks:
@@ -723,7 +1010,8 @@ class LokyBot:
         if self._cfg.dynamic_leverage_enabled and self._portfolio_risk is not None:
             try:
                 atr = self._indicators.atr()
-                dyn_lev = self._portfolio_risk.dynamic_leverage(atr)
+                dd_pct = self._account_risk.current_drawdown_pct if self._account_risk else _ZERO
+                dyn_lev = self._portfolio_risk.dynamic_leverage(atr, drawdown_pct=dd_pct)
                 max_notional = self._capital * Decimal(str(dyn_lev))
                 if signal.entry_price > _ZERO:
                     max_dyn_size = (max_notional / signal.entry_price).quantize(Decimal('0.001'))
@@ -735,6 +1023,22 @@ class LokyBot:
                         signal.size = max_dyn_size
             except ValueError:
                 pass  # ATR non pronto, usa leva statica
+
+        # Portfolio heat: riduce size se portafoglio troppo esposto in una direzione
+        if self._portfolio_risk is not None:
+            heat_mod = self._portfolio_risk.heat_size_modifier()
+            if heat_mod < Decimal('1'):
+                signal.size = (signal.size * heat_mod).quantize(Decimal('0.001'))
+                logger.debug("%s Portfolio heat: size ×%.1f", self.symbol, float(heat_mod))
+
+        # Portfolio risk check (POST size adjustments): verifica notional effettivo
+        if self._portfolio_risk is not None:
+            final_notional = signal.entry_price * signal.size
+            ok, reason = self._portfolio_risk.can_open(self.symbol, final_notional)
+            if not ok:
+                logger.info("%s Entry bloccata da PortfolioRisk (post-adj): %s", self.symbol, reason)
+                self._state = BotState.FLAT
+                return
 
         # Validazione size finale: blocca size invalide prima che arrivino al gateway
         min_notional = Decimal('6')   # Bybit minimum
@@ -753,11 +1057,28 @@ class LokyBot:
             self._state = BotState.FLAT
             return
 
+        # Slippage estimation: verifica e adatta la size se slippage eccessivo
+        try:
+            vol_ma = self._indicators.volume_ma()
+            ok, est_slip = self._slippage_est.is_acceptable(signal.entry_price, signal.size, vol_ma)
+            if not ok:
+                adjusted = self._slippage_est.adjusted_size(signal.entry_price, signal.size, vol_ma)
+                if adjusted <= _ZERO:
+                    logger.warning(
+                        "%s Slippage troppo alto (%.2f%%) — entry annullata.",
+                        self.symbol, float(est_slip * 100),
+                    )
+                    self._state = BotState.FLAT
+                    return
+                signal.size = adjusted
+        except ValueError:
+            est_slip = self._cfg.slippage_pct
+
         logger.info(
-            "%s [Loky] ENTRATA %s (%s) | entry≈%.4f tp=%.4f sl=%.4f size=%.3f score=%.0f",
+            "%s [Loky] ENTRATA %s (%s) | entry≈%.4f tp=%.4f sl=%.4f size=%.3f score=%.0f slip≈%.2f%%",
             self.symbol, signal.signal_type.name, signal.strategy_name,
             signal.entry_price, signal.take_profit, signal.stop_loss,
-            signal.size, signal.score,
+            signal.size, signal.score, float(est_slip * 100),
         )
 
         if not self._cfg.live_trading_enabled:
@@ -765,7 +1086,7 @@ class LokyBot:
                 self._candles[-1].close if self._candles else signal.entry_price
             )
             fill_price = self._calc_paper_fill_price(base_price, side, signal.size)
-            self._open_position(side, signal.size, fill_price, signal)
+            await self._open_position(side, signal.size, fill_price, signal)
             return
 
         # Limit entry con market fallback: risparmia ~50% fee (maker vs taker)
@@ -783,7 +1104,7 @@ class LokyBot:
             return
         self._entry_order = order
 
-    def _open_position(
+    async def _open_position(
         self,
         side: Side,
         size: Decimal,
@@ -798,15 +1119,25 @@ class LokyBot:
         self._entry_time         = time.time()
         self._state              = BotState.POSITION_OPEN
         self._accumulated_trade_pnl = _ZERO
+        self._partial_locked_pnl   = _ZERO
         self._kelly_risk_size    = size        # snapshot pre-scale-in per Kelly
         self._kelly_risk_entry   = fill_price  # entry originale per Kelly
 
         atr = signal.atr
         s   = self._cfg.strategy
 
-        # SL su struttura di mercato: il più lontano tra ATR-based e swing structure.
-        # Questo riduce i whipsaw posizionando lo SL sotto/sopra minimi/massimi recenti.
-        atr_sl_distance = s.sl_atr_mult * atr
+        # Score-adaptive SL: alta confidenza → SL stretto, bassa → SL largo
+        # (Size boost spostato in _apply_signal_modifiers() per rispettare il 40% cap)
+        score = signal.score
+        if score >= Decimal('85'):
+            sl_score_mult = Decimal('0.8')
+        elif score >= Decimal('70'):
+            sl_score_mult = _ONE
+        else:
+            sl_score_mult = Decimal('1.3')
+
+        # SL su struttura di mercato
+        atr_sl_distance = s.sl_atr_mult * atr * sl_score_mult
 
         if side == Side.BUY:
             atr_sl = fill_price - atr_sl_distance
@@ -825,13 +1156,23 @@ class LokyBot:
                 self._sl_price = atr_sl
         self._sl_price_orig = self._sl_price
 
-        # 3 livelli di Partial TP
-        # TP3 viene affinato usando il livello S/R più vicino nella direzione del trade:
-        # questo posiziona il target finale su struttura reale invece di ATR fisso.
+        # Regime-specific TP multiplier: allarga/stringe i target in base al regime
+        regime = self._aggregator.detect_regime()
+        if regime == "STRONG_TREND":
+            tp_mult = Decimal('1.5')  # trend forte: target più lontani
+        elif regime == "RANGING":
+            tp_mult = Decimal('0.7')  # ranging: target più stretti
+        elif regime == "CHOPPY":
+            tp_mult = Decimal('0.5')  # choppy: exit rapido
+        else:
+            tp_mult = Decimal('1.0')
+
+        # 3 livelli di Partial TP (adattati al regime)
+        # TP3 viene affinato usando il livello S/R più vicino nella direzione del trade.
         if side == Side.BUY:
-            tp1 = fill_price + s.partial_tp1_atr * atr
-            tp2 = fill_price + s.partial_tp2_atr * atr
-            tp3_atr = fill_price + s.partial_tp3_atr * atr
+            tp1 = fill_price + s.partial_tp1_atr * atr * tp_mult
+            tp2 = fill_price + s.partial_tp2_atr * atr * tp_mult
+            tp3_atr = fill_price + s.partial_tp3_atr * atr * tp_mult
             # Usa la resistenza strutturale più vicina sopra fill_price come TP3 se disponibile
             # e se cade tra TP2 e tp3_atr × 1.5 (non troppo vicino né troppo lontano)
             try:
@@ -852,9 +1193,9 @@ class LokyBot:
                 TPLevel(tp3, s.partial_tp3_pct),
             ]
         else:
-            tp1 = fill_price - s.partial_tp1_atr * atr
-            tp2 = fill_price - s.partial_tp2_atr * atr
-            tp3_atr = fill_price - s.partial_tp3_atr * atr
+            tp1 = fill_price - s.partial_tp1_atr * atr * tp_mult
+            tp2 = fill_price - s.partial_tp2_atr * atr * tp_mult
+            tp3_atr = fill_price - s.partial_tp3_atr * atr * tp_mult
             # Usa il supporto strutturale più vicino sotto fill_price come TP3 per SHORT
             try:
                 nearest_s = self._indicators.nearest_support_below(fill_price)
@@ -905,7 +1246,7 @@ class LokyBot:
             ))
 
         self._start_hold_time_check()
-        self._save_state()
+        await self._save_state()
 
         if _prom:
             _position_gauge.labels(symbol=self.symbol).set(1)
@@ -915,7 +1256,7 @@ class LokyBot:
             logger.warning("%s Fill ricevuto prima di _entry_order — ignorato.", self.symbol)
             return
         if self._state == BotState.ENTERING and self._entry_order and order.id == self._entry_order.id:
-            self._open_position(order.side, order.filled_size, order.price, self._current_signal)
+            await self._open_position(order.side, order.filled_size, order.price, self._current_signal)
             if self._cfg.live_trading_enabled and self._tp_levels:
                 await self._gw.submit_tp_sl(
                     self.symbol,
@@ -970,6 +1311,7 @@ class LokyBot:
         self.total_trades  += 1
         self._position_size -= close_size
         self._accumulated_trade_pnl += pnl
+        self._partial_locked_pnl += pnl  # traccia profitto locked per Kelly
         self._state = BotState.PARTIAL_EXIT
 
         logger.info(
@@ -1054,12 +1396,16 @@ class LokyBot:
         # invece di ricalcolare su position_size_orig × ultimo exit_price (errato con partial TP)
         total_pnl_trade = self._accumulated_trade_pnl
 
-        # Aggiorna Kelly con il risultato del trade completo
-        # Usa entry/size originali pre-scale-in per non corrompere il risk_amount
+        # Aggiorna Kelly con il risultato del trade completo.
+        # risk_amount netto: rischio iniziale meno profitto già locked da partial exits.
+        # Dopo TP1 lo SL va a breakeven → il rischio residuo è effettivamente ridotto.
+        # Questo evita di sovrastimare il win rate nel Kelly Criterion.
         kelly_entry = self._kelly_risk_entry if self._kelly_risk_entry > _ZERO else self._entry_price
         kelly_size  = self._kelly_risk_size  if self._kelly_risk_size  > _ZERO else self._position_size_orig
         sl_distance = abs(kelly_entry - self._sl_price_orig)
-        risk_amount = sl_distance * kelly_size
+        gross_risk  = sl_distance * kelly_size
+        # Rischio netto = max(rischio lordo - profitto locked, piccolo floor per evitare div/0)
+        risk_amount = max(gross_risk - self._partial_locked_pnl, gross_risk * Decimal('0.1'))
         self._kelly.update(total_pnl_trade, risk_amount)
 
         # PnL attribution per strategy engine (per analytics/performance review)
@@ -1070,6 +1416,8 @@ class LokyBot:
         self.trades_by_strategy[strategy_name] = (
             self.trades_by_strategy.get(strategy_name, 0) + 1
         )
+        # Aggiorna pesi adattivi per strategia nell'aggregator
+        self._aggregator.record_trade_result(strategy_name, total_pnl_trade)
 
         if _prom:
             result_label = "win" if total_pnl_trade > _ZERO else "loss"
@@ -1116,7 +1464,7 @@ class LokyBot:
             self._portfolio_risk.register_close(self.symbol)
 
         self._reset_position_state()
-        self._save_state()
+        await self._save_state()
 
     async def _exit_position_market(self, reason: str) -> None:
         """Chiude la posizione con ordine market (es. max hold time)."""
@@ -1181,6 +1529,13 @@ class LokyBot:
         fee = self._entry_price * size * entry_fee_rate + exit_price * size * self._cfg.fee_taker
         return gross - fee
 
+    @property
+    def unrealized_pnl(self) -> Decimal:
+        """PnL non realizzato della posizione aperta corrente."""
+        if self._position_size <= _ZERO or self._position_side is None:
+            return _ZERO
+        return self._calc_pnl_for_size(self._last_price, self._position_size)
+
     def _calc_paper_fill_price(
         self, base_price: Decimal, side: Side, size: Decimal
     ) -> Decimal:
@@ -1222,9 +1577,9 @@ class LokyBot:
     # Persistenza
     # ------------------------------------------------------------------
 
-    def _save_state(self) -> None:
+    async def _save_state(self) -> None:
         inv = self._position_size if self._position_side == Side.BUY else -self._position_size
-        self._state_mgr.update_snapshot(
+        await self._state_mgr.update_snapshot(
             net_inventory=inv,
             pnl=self.realized_pnl,
             avg_entry=self._entry_price,
@@ -1237,8 +1592,51 @@ class LokyBot:
         if snap:
             self.realized_pnl = snap.get("pnl", _ZERO)
             self.total_trades  = snap.get("fills_total", 0)
-            logger.info("%s [Loky] Stato caricato: PnL=%.4f USDT, trade=%d",
-                        self.symbol, self.realized_pnl, self.total_trades)
+
+            # Ripristino posizione: se net_inventory != 0, il bot aveva una posizione aperta
+            inv = snap.get("net_inventory", _ZERO)
+            avg_entry = snap.get("avg_entry", _ZERO)
+            if inv != _ZERO and avg_entry > _ZERO:
+                self._position_size = abs(inv)
+                self._position_size_orig = abs(inv)
+                self._position_side = Side.BUY if inv > _ZERO else Side.SELL
+                self._entry_price = avg_entry
+                self._state = BotState.POSITION_OPEN
+                self._kelly_risk_size = abs(inv)
+                self._kelly_risk_entry = avg_entry
+
+                # Ricostruisci SL e TP di emergenza basati su config default
+                # (gli indicatori potrebbero non essere pronti al load, verranno
+                # aggiornati al primo on_candle con trailing/partial TP)
+                sl_mult = self._cfg.strategy.sl_atr_mult
+                tp1_mult = self._cfg.strategy.partial_tp1_atr
+                # SL di emergenza: usa 2% del prezzo come fallback se ATR non disponibile
+                emergency_sl_dist = avg_entry * Decimal('0.02')
+                if self._position_side == Side.BUY:
+                    self._sl_price = avg_entry - emergency_sl_dist
+                    self._tp_levels = [
+                        TPLevel(avg_entry + emergency_sl_dist * Decimal('1.5'), self._cfg.strategy.partial_tp1_pct),
+                        TPLevel(avg_entry + emergency_sl_dist * Decimal('2.5'), self._cfg.strategy.partial_tp2_pct),
+                        TPLevel(avg_entry + emergency_sl_dist * Decimal('4.0'), self._cfg.strategy.partial_tp3_pct),
+                    ]
+                else:
+                    self._sl_price = avg_entry + emergency_sl_dist
+                    self._tp_levels = [
+                        TPLevel(avg_entry - emergency_sl_dist * Decimal('1.5'), self._cfg.strategy.partial_tp1_pct),
+                        TPLevel(avg_entry - emergency_sl_dist * Decimal('2.5'), self._cfg.strategy.partial_tp2_pct),
+                        TPLevel(avg_entry - emergency_sl_dist * Decimal('4.0'), self._cfg.strategy.partial_tp3_pct),
+                    ]
+                self._sl_price_orig = self._sl_price
+
+                logger.warning(
+                    "%s [Loky] POSIZIONE RIPRISTINATA: %s %.3f @ %.4f | "
+                    "SL=%.4f TP1=%.4f (emergency defaults, ATR-based al primo candle).",
+                    self.symbol, self._position_side.name, self._position_size,
+                    avg_entry, self._sl_price, self._tp_levels[0].price,
+                )
+            else:
+                logger.info("%s [Loky] Stato caricato: PnL=%.4f USDT, trade=%d (FLAT)",
+                            self.symbol, self.realized_pnl, self.total_trades)
 
     # ------------------------------------------------------------------
     # Anti-martingale sizing
@@ -1402,14 +1800,16 @@ class LokyBot:
             self._entry_price = (
                 (self._entry_price * self._position_size + fill_price * add_size) / total_size
             )
-        self._position_size      += add_size
-        self._position_size_orig += add_size  # estende la size base per Kelly
-        self._scale_in_count     += 1
-        self._scale_in_size      += add_size
+        self._position_size  += add_size
+        # NON aggiornare _position_size_orig: Kelly usa _kelly_risk_size (snapshot pre-scale-in)
+        # per evitare di corrompere il calcolo del risk_amount.
+        self._scale_in_count += 1
+        self._scale_in_size  += add_size
 
-        # Aggiorna portfolio risk con il notional aggiuntivo
+        # Aggiorna portfolio risk: aggiorna il notional in-place (non registrare doppia apertura)
         if self._portfolio_risk is not None:
-            self._portfolio_risk.register_open(self.symbol, fill_price * add_size)
+            current = self._portfolio_risk._open_notional.get(self.symbol, _ZERO)
+            self._portfolio_risk._open_notional[self.symbol] = current + fill_price * add_size
 
         logger.info(
             "%s [Loky] SCALE-IN #%d (%s) | +%.3f @ %.4f | size totale=%.3f | "
@@ -1438,6 +1838,7 @@ class LokyBot:
         self._sl_price            = _ZERO
         self._sl_price_orig       = _ZERO
         self._tp_levels           = []
+        self._tp_adjusted         = False
         self._pending_signal      = None
         self._scale_in_count      = 0
         self._scale_in_size       = _ZERO

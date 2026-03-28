@@ -23,6 +23,7 @@ from decimal import Decimal
 from src.config import BotSettings
 from src.models import Candle, Signal, SignalType
 from src.strategy.indicator_engine import IndicatorEngine
+from src.strategy.sizing import calc_risk_size
 
 logger = logging.getLogger(__name__)
 
@@ -89,12 +90,12 @@ class MeanReversionEngine:
         vol_ratio = candle.volume / vol_ma if vol_ma > _ZERO else Decimal('1')
         volume_ok = True  # Mean reversion accetta qualsiasi volume in ranging
         vol_score_bonus = _ZERO
-        if vol_ratio > Decimal('2.0'):
+        if vol_ratio > Decimal('3.0'):
+            vol_score_bonus = Decimal('-5')   # Volume eccessivo = possibile trend forte, cautela
+        elif vol_ratio > Decimal('2.0'):
             vol_score_bonus = Decimal('8')    # Spike volume = capitolazione → segnale forte
         elif vol_ratio > Decimal('1.5'):
             vol_score_bonus = Decimal('4')
-        elif vol_ratio > Decimal('3.0'):
-            vol_score_bonus = Decimal('-5')   # Volume eccessivo = possibile trend forte, cautela
 
         # BB width check: evita entry quando le bande sono troppo strette (squeeze imminente)
         bb_width = _ZERO
@@ -105,11 +106,16 @@ class MeanReversionEngine:
 
         base_score = Decimal('65')
 
+        # Tolerance dinamica basata su ATR: asset più volatile → tolerance più stretta
+        # (la BB è già scalata per volatilità, tolerance fissa aggiunge rumore)
+        atr_pct = atr_val / candle.close if candle.close > _ZERO else Decimal('0.005')
+        bb_tolerance = Decimal('1') + min(atr_pct * Decimal('0.3'), Decimal('0.005'))
+
         # ---- LONG (rimbalzo da BB lower) --------------------------------
         if (
             adx_ok
             and volume_ok
-            and candle.close <= bb_lower * Decimal('1.002')
+            and candle.close <= bb_lower * bb_tolerance
             and rsi_val < self._cfg.mr_rsi_oversold
             and ema_fast > ema_slow * Decimal('0.995')
         ):
@@ -142,7 +148,7 @@ class MeanReversionEngine:
         if (
             adx_ok
             and volume_ok
-            and candle.close >= bb_upper * Decimal('0.998')
+            and candle.close >= bb_upper * (Decimal('2') - bb_tolerance)
             and rsi_val > self._cfg.mr_rsi_overbought
             and ema_fast < ema_slow * Decimal('1.005')
         ):
@@ -177,19 +183,11 @@ class MeanReversionEngine:
     # ------------------------------------------------------------------
 
     def _calc_size(self, atr: Decimal, price: Decimal) -> Decimal:
-        risk_usdt   = self._capital * self._top_cfg.risk_per_trade_pct
         sl_distance = self._cfg.sl_atr_mult * atr
-        if sl_distance == _ZERO or price == _ZERO:
-            return _ZERO
-
-        raw_size     = risk_usdt / sl_distance
-        max_notional = self._capital * Decimal(str(self._top_cfg.leverage))
-        max_size     = max_notional / price
-        size         = min(raw_size, max_size).quantize(Decimal('0.001'))
-
-        if size * price < _MIN_NOTIONAL:
-            return _ZERO
-        return size
+        return calc_risk_size(
+            self._capital, self._top_cfg.risk_per_trade_pct,
+            sl_distance, self._top_cfg.leverage, price,
+        )
 
     @staticmethod
     def _no_signal(candle: Candle | None) -> Signal:

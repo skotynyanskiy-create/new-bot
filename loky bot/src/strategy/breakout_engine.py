@@ -25,6 +25,7 @@ from decimal import Decimal
 from src.config import BotSettings
 from src.models import Candle, Signal, SignalType
 from src.strategy.indicator_engine import IndicatorEngine
+from src.strategy.sizing import calc_risk_size
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,22 @@ class BreakoutEngine:
 
         volume_ok = self._volume_ok(candle, vol_ma)
 
+        # Multi-candle level validation: il HH/LL deve essere stato testato
+        # da almeno 2 candle per essere un livello reale (evita spike singoli)
+        lookback = self._cfg.breakout_lookback
+        if len(candles) >= lookback:
+            recent = list(candles)[-lookback:]
+            hh_touches = sum(1 for c in recent if c.high >= hh * Decimal('0.998'))
+            ll_touches = sum(1 for c in recent if c.low <= ll * Decimal('1.002'))
+        else:
+            hh_touches = 1
+            ll_touches = 1
+
+        # Dynamic min touches: alta volatilità (ATR > 0.5% prezzo) → 1 touch ok
+        # Bassa volatilità → 2 touches richiesti (conferma più forte)
+        atr_pct = atr_val / candle.close if candle.close > _ZERO else _ZERO
+        min_touches = 1 if atr_pct > Decimal('0.005') else 2
+
         # VWAP filter: LONG solo se prezzo > VWAP (bullish volume bias)
         vwap_long_ok  = self._indicators.price_above_vwap(candle.close)
         vwap_short_ok = self._indicators.price_below_vwap(candle.close)
@@ -99,6 +116,7 @@ class BreakoutEngine:
             candle.close > hh
             and is_bullish
             and volume_ok
+            and hh_touches >= min_touches   # livello testato da almeno 2 candle
             and self._cfg.rsi_min <= rsi_val <= self._cfg.rsi_max
             and ema_fast > ema_slow
             and vwap_long_ok
@@ -134,16 +152,17 @@ class BreakoutEngine:
                 )
 
         # ---- SHORT -------------------------------------------------------
-        # RSI SHORT: simmetrico al LONG.
-        # SHORT valido se RSI è ipervenduto (< rsi_min) — momentum ribassista
-        #             O ipercomprato (> rsi_max) — mean-reversion short da eccesso
-        # Questo esclude la zona neutrale [rsi_min, rsi_max] dove il trend non è chiaro.
-        rsi_short_ok = rsi_val < self._cfg.rsi_min or rsi_val > self._cfg.rsi_max
+        # RSI SHORT: breakout ribassista richiede momentum ribassista (RSI basso).
+        # Specularmente al LONG (rsi_min <= rsi <= rsi_max), lo SHORT richiede
+        # RSI nella banda bassa: (100 - rsi_max) <= RSI <= (100 - rsi_min).
+        # Default: 28 <= RSI <= 55 per SHORT (momentum ribassista, non ipervenduto estremo).
+        rsi_short_ok = (Decimal('100') - self._cfg.rsi_max) <= rsi_val <= (Decimal('100') - self._cfg.rsi_min)
         is_bearish = candle.close < candle.open
         if (
             candle.close < ll
             and is_bearish
             and volume_ok
+            and ll_touches >= min_touches   # livello testato da almeno 2 candle
             and rsi_short_ok
             and ema_fast < ema_slow
             and vwap_short_ok
@@ -189,35 +208,11 @@ class BreakoutEngine:
         return candle.volume >= self._cfg.volume_multiplier * vol_ma
 
     def _calc_size(self, atr: Decimal, price: Decimal) -> Decimal:
-        """
-        size = (capitale × risk_pct) / (sl_atr_mult × ATR)
-        Limita a: notional <= capitale × leva
-        Valida: notional >= _MIN_NOTIONAL (minimo Binance Futures $6)
-        """
-        risk_usdt   = self._capital * self._top_cfg.risk_per_trade_pct
         sl_distance = self._cfg.sl_atr_mult * atr
-        if sl_distance == _ZERO or price == _ZERO:
-            return _ZERO
-
-        raw_size = risk_usdt / sl_distance
-
-        # Limita a notional massimo = capitale × leva
-        max_notional = self._capital * Decimal(str(self._top_cfg.leverage))
-        max_size     = max_notional / price
-        size         = min(raw_size, max_size)
-
-        # Arrotonda a 3 decimali (step size comune per BTC/ETH Futures)
-        size = size.quantize(Decimal('0.001'))
-
-        # Verifica notional minimo Binance Futures
-        if size * price < _MIN_NOTIONAL:
-            logger.debug(
-                "Size %.6f troppo piccola (notional=%.2f USDT < %.0f USDT min). Segnale scartato.",
-                size, float(size * price), float(_MIN_NOTIONAL),
-            )
-            return _ZERO
-
-        return size
+        return calc_risk_size(
+            self._capital, self._top_cfg.risk_per_trade_pct,
+            sl_distance, self._top_cfg.leverage, price,
+        )
 
     @staticmethod
     def _no_signal(candle: Candle | None) -> Signal:

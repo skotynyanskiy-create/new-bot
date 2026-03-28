@@ -661,3 +661,109 @@ if __name__ == "__main__":
             print(f"\nSharpe OOS medio (tutti i symbol): {avg_all:.2f}")
 
     asyncio.run(_main())
+
+
+# ---------------------------------------------------------------------------
+# RollingOptimizer — adattamento parametri in tempo reale
+# ---------------------------------------------------------------------------
+
+class RollingOptimizer:
+    """
+    Ottimizzatore rolling che adatta i parametri di trading in tempo reale
+    basandosi sulla performance degli ultimi N trade.
+
+    Traccia il win rate per ogni valore di parametro usato e suggerisce
+    aggiustamenti graduali (max 10% per iterazione).
+
+    Args:
+        param_ranges — dict {nome_param: (min, max, step)}
+        window — numero di trade per finestra rolling (default 50)
+        adjust_pct — max aggiustamento per iterazione (default 0.10 = 10%)
+    """
+
+    def __init__(
+        self,
+        param_ranges: dict[str, tuple[float, float, float]] | None = None,
+        window: int = 50,
+        adjust_pct: float = 0.10,
+    ) -> None:
+        from decimal import Decimal
+        self._ranges = param_ranges or {
+            "tp_atr_mult": (1.5, 4.0, 0.25),
+            "sl_atr_mult": (0.5, 1.5, 0.25),
+            "mr_adx_max": (15.0, 30.0, 2.0),
+            "tf_adx_min": (20.0, 35.0, 2.0),
+            "breakout_lookback": (10.0, 50.0, 5.0),
+        }
+        self._window = window
+        self._adjust_pct = adjust_pct
+
+        # Trade results per parametro: {param: [(value_used, pnl), ...]}
+        self._history: dict[str, list[tuple[float, float]]] = {
+            k: [] for k in self._ranges
+        }
+
+    def record_trade(self, params_used: dict[str, float], pnl: float) -> None:
+        """Registra il risultato di un trade con i parametri usati."""
+        for name in self._ranges:
+            if name in params_used:
+                self._history[name].append((params_used[name], pnl))
+                # Mantieni solo gli ultimi N trade
+                if len(self._history[name]) > self._window:
+                    self._history[name] = self._history[name][-self._window:]
+
+    def suggest(self, current_params: dict[str, float]) -> dict[str, float]:
+        """
+        Suggerisce parametri ottimizzati basandosi sulla performance rolling.
+
+        Per ogni parametro:
+          1. Calcola il PnL medio per il valore corrente
+          2. Calcola il PnL medio per valori adiacenti (±step)
+          3. Se un valore adiacente è significativamente migliore, sposta verso quello
+          4. Max spostamento: adjust_pct del range
+
+        Returns:
+            dict con parametri suggeriti (stessi nomi, valori potenzialmente diversi)
+        """
+        suggested = dict(current_params)
+
+        for name, (lo, hi, step) in self._ranges.items():
+            history = self._history.get(name, [])
+            if len(history) < 20:
+                continue  # dati insufficienti
+
+            current_val = current_params.get(name)
+            if current_val is None:
+                continue
+
+            # Calcola PnL medio per il valore corrente
+            current_pnls = [pnl for val, pnl in history if abs(val - current_val) < step * 0.5]
+            if not current_pnls:
+                continue
+            current_avg = sum(current_pnls) / len(current_pnls)
+
+            # Prova valore superiore
+            up_val = min(current_val + step, hi)
+            up_pnls = [pnl for val, pnl in history if abs(val - up_val) < step * 0.5]
+            up_avg = sum(up_pnls) / len(up_pnls) if up_pnls else current_avg
+
+            # Prova valore inferiore
+            down_val = max(current_val - step, lo)
+            down_pnls = [pnl for val, pnl in history if abs(val - down_val) < step * 0.5]
+            down_avg = sum(down_pnls) / len(down_pnls) if down_pnls else current_avg
+
+            # Sposta verso il migliore (max adjust_pct del range)
+            max_move = (hi - lo) * self._adjust_pct
+            best_avg = max(current_avg, up_avg, down_avg)
+
+            if best_avg == up_avg and up_avg > current_avg * 1.05:
+                suggested[name] = min(current_val + min(step, max_move), hi)
+            elif best_avg == down_avg and down_avg > current_avg * 1.05:
+                suggested[name] = max(current_val - min(step, max_move), lo)
+
+        return suggested
+
+    @property
+    def has_enough_data(self) -> bool:
+        """True se almeno un parametro ha abbastanza dati per suggerire."""
+        return any(len(h) >= 20 for h in self._history.values())

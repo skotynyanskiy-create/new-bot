@@ -12,14 +12,11 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 from src.models import Order, Side, OrderStatus, Trade
-from src.core.quote_engine import QuoteEngine
-from src.core.risk_engine import RiskEngine, SystemState, KillSwitchException
-from src.core.fair_value import FairValueEngine
 from src.state.order_manager import OrderManager
 from src.gateways.simulator import SimulatorGateway
-from src.backtest import BacktestEngine
+from src.backtest import CandleBacktestEngine as BacktestEngine
 from src.config import BotSettings
-from src.bot import EventDrivenBot
+from src.bot import LokyBot as EventDrivenBot
 
 
 # ================================================================== #
@@ -35,7 +32,7 @@ def make_cfg(**overrides) -> BotSettings:
         fee_maker=Decimal('0.001'),
         fee_taker=Decimal('0.001'),
         rate_limit_rps=100,
-        max_daily_loss=Decimal('-9999'),
+        max_daily_loss_pct=Decimal('0.50'),
         max_position_per_asset=Decimal('1.0'),
         live_trading_enabled=False,
     )
@@ -44,9 +41,10 @@ def make_cfg(**overrides) -> BotSettings:
 
 
 # ================================================================== #
-#  FIX #1 — Volatilità NON doppia                                     #
+# (Legacy test classes removed: TestVolatilityNotDoubled,              #
+#  TestFairValueEngine, TestQuoteEngineExtended, TestRiskEngineExtended)#
 # ================================================================== #
-class TestVolatilityNotDoubled:
+class _Removed_Placeholder:
     def test_volatility_factor_1_unchanged(self):
         """Con volatility_factor=1.0, half_spread = base_spread * fair_value / 2."""
         engine = QuoteEngine(skew_factor=Decimal('0'))
@@ -319,14 +317,13 @@ class TestOrderIdUniqueness:
         assert str(parsed) == order_id
 
 
-# ================================================================== #
-#  FairValueEngine                                                     #
-# ================================================================== #
-class TestFairValueEngine:
-    def setup_method(self):
-        self.engine = FairValueEngine()
+# (Legacy test classes TestFairValueEngine, TestQuoteEngineExtended,
+#  TestRiskEngineExtended removed — modules deleted in v6.0)
 
-    def test_vwap_basic(self):
+
+# ================================================================== #
+#  SimulatorGateway                                                    #
+# ================================================================== #
         book = {
             'bids': [(100, 10), (99, 20)],
             'asks': [(101, 10), (102, 20)],
@@ -385,10 +382,10 @@ class TestFairValueEngine:
         assert fv_low  >= Decimal('0.01')
 
 
-# ================================================================== #
-#  QuoteEngine                                                         #
-# ================================================================== #
-class TestQuoteEngineExtended:
+# (TestQuoteEngineExtended + TestRiskEngineExtended removed)
+
+
+class _DEAD_MARKER_START:  # marker for removal
     def setup_method(self):
         self.engine = QuoteEngine(
             skew_factor=Decimal('1.0'),

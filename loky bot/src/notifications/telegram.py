@@ -58,8 +58,11 @@ class TelegramNotifier:
         self._paused: bool = False
         self._last_update_id: int = 0
 
-        # Callback per status (iniettata dall'orchestratore)
+        # Callback per comandi (iniettati dall'orchestratore)
         self._status_callback: Optional[Callable] = None
+        self._equity_callback: Optional[Callable] = None
+        self._drawdown_callback: Optional[Callable] = None
+        self._strategy_callback: Optional[Callable] = None
 
         # Contatore errori API per alert automatici
         self._api_errors: list[float] = []   # timestamp degli errori recenti
@@ -71,6 +74,15 @@ class TelegramNotifier:
     def set_status_callback(self, callback: Callable) -> None:
         """Inietta callback per risposta a /status. Deve ritornare una stringa."""
         self._status_callback = callback
+
+    def set_equity_callback(self, callback: Callable) -> None:
+        self._equity_callback = callback
+
+    def set_drawdown_callback(self, callback: Callable) -> None:
+        self._drawdown_callback = callback
+
+    def set_strategy_callback(self, callback: Callable) -> None:
+        self._strategy_callback = callback
 
     @property
     def is_paused(self) -> bool:
@@ -233,6 +245,38 @@ class TelegramNotifier:
                 else:
                     status_text = "Status callback non configurato."
                 await self._send(f"📊 <b>STATUS</b>\n{status_text}")
+            elif text == "/equity":
+                if self._equity_callback:
+                    try:
+                        eq_text = await asyncio.wait_for(self._equity_callback(), timeout=3.0)
+                    except Exception:
+                        eq_text = "Errore recupero equity."
+                    await self._send(f"💰 <b>EQUITY</b>\n{eq_text}")
+            elif text == "/drawdown":
+                if self._drawdown_callback:
+                    try:
+                        dd_text = await asyncio.wait_for(self._drawdown_callback(), timeout=3.0)
+                    except Exception:
+                        dd_text = "Errore recupero drawdown."
+                    await self._send(f"📉 <b>DRAWDOWN</b>\n{dd_text}")
+            elif text == "/strategy":
+                if self._strategy_callback:
+                    try:
+                        strat_text = await asyncio.wait_for(self._strategy_callback(), timeout=3.0)
+                    except Exception:
+                        strat_text = "Errore recupero strategia."
+                    await self._send(f"🎯 <b>STRATEGIE</b>\n{strat_text}")
+            elif text == "/help":
+                await self._send(
+                    "🤖 <b>LOKY BOT — Comandi</b>\n\n"
+                    "/status — Stato generale\n"
+                    "/equity — Equity e PnL\n"
+                    "/drawdown — Drawdown corrente\n"
+                    "/strategy — Performance per strategia\n"
+                    "/pause — Pausa trading\n"
+                    "/resume — Riprendi trading\n"
+                    "/help — Questo messaggio"
+                )
 
     async def daily_summary(
         self,

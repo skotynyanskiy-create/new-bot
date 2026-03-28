@@ -58,6 +58,9 @@ _OKX_TF_MAP = {
     "1d": "1D", "1w": "1W",
 }
 
+# CryptoCompare fallback (dati storici fino a 3 anni per hourly)
+_CRYPTOCOMPARE_URL = "https://min-api.cryptocompare.com/data/v2/histohour"
+
 # OKX symbol map (Bybit "BTCUSDT" → OKX "BTC-USDT")
 def _to_okx_symbol(symbol: str) -> str:
     if symbol.endswith("USDT"):
@@ -395,10 +398,13 @@ class CandleBacktestEngine:
             "Bybit %s %s: %d candele scaricate.", self.symbol, timeframe, len(result)
         )
 
-        # Fallback a OKX se Bybit non ha restituito dati
+        # Fallback chain: Bybit → OKX → CryptoCompare
         if not result:
-            logger.warning("Bybit fallito per %s %s — provo OKX come fallback...", self.symbol, timeframe)
+            logger.warning("Bybit fallito per %s %s — provo OKX...", self.symbol, timeframe)
             result = await self._fetch_candles_okx(timeframe)
+        if not result:
+            logger.warning("OKX fallito per %s %s — provo CryptoCompare...", self.symbol, timeframe)
+            result = await self._fetch_candles_cryptocompare(timeframe)
 
         # Salva in cache locale
         if result:
@@ -489,6 +495,91 @@ class CandleBacktestEngine:
                 result.append(c)
 
         logger.info("OKX %s %s: %d candele scaricate.", self.symbol, timeframe, len(result))
+        return result
+
+    async def _fetch_candles_cryptocompare(self, timeframe: str) -> List[Candle]:
+        """
+        Fallback: CryptoCompare histohour API. Supporta dati storici fino a 3 anni.
+        Nota: solo hourly disponibile (1h), non 15m. Per 15m usa OKX/Bybit.
+        Per 1h e 4h funziona perfettamente con dati storici profondi.
+        """
+        # Mappa timeframe → aggregate parameter
+        tf_aggregate = {"1h": 1, "2h": 2, "4h": 4, "15m": 1, "30m": 1}
+        aggregate = tf_aggregate.get(timeframe, 1)
+
+        # Per 15m: CryptoCompare non supporta minute data storici.
+        # Usa hourly come approssimazione (4 candle 15m → 1 candle 1h)
+        use_hourly = timeframe in ("15m", "30m", "1h", "2h", "4h")
+        if not use_hourly:
+            return []
+
+        # Converte symbol: "BTCUSDT" → fsym="BTC", tsym="USDT"
+        base = self.symbol.replace("USDT", "")
+        end_ts = int(time.time())
+        start_ts = end_ts - self.days * 86_400
+        candles: List[Candle] = []
+        proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+
+        async with aiohttp.ClientSession() as session:
+            cur_end = end_ts
+            while cur_end > start_ts:
+                params = {
+                    "fsym": base, "tsym": "USDT",
+                    "limit": 2000, "toTs": cur_end,
+                    "aggregate": aggregate,
+                }
+                try:
+                    async with session.get(
+                        _CRYPTOCOMPARE_URL, params=params,
+                        timeout=aiohttp.ClientTimeout(total=15),
+                        proxy=proxy,
+                    ) as resp:
+                        data = await resp.json()
+                except Exception as e:
+                    logger.error("CryptoCompare fetch fallito: %s", e)
+                    break
+
+                if data.get("Response") != "Success":
+                    logger.error("CryptoCompare errore: %s", data.get("Message"))
+                    break
+
+                rows = data.get("Data", {}).get("Data", [])
+                if not rows:
+                    break
+
+                for row in rows:
+                    ts = row["time"]
+                    if ts < start_ts:
+                        continue
+                    if row.get("volumefrom", 0) == 0 and row.get("open", 0) == 0:
+                        continue  # candle vuota
+                    candles.append(Candle(
+                        symbol=self.symbol,
+                        timeframe=timeframe if timeframe != "15m" else "1h",
+                        open=Decimal(str(row["open"])),
+                        high=Decimal(str(row["high"])),
+                        low=Decimal(str(row["low"])),
+                        close=Decimal(str(row["close"])),
+                        volume=Decimal(str(row.get("volumefrom", 0))),
+                        timestamp=float(ts),
+                        is_closed=True,
+                    ))
+
+                oldest = rows[0]["time"]
+                if oldest <= start_ts:
+                    break
+                cur_end = oldest - 1
+                await asyncio.sleep(0.2)
+
+        # Deduplica e ordina
+        seen: set = set()
+        result: List[Candle] = []
+        for c in sorted(candles, key=lambda x: x.timestamp):
+            if c.timestamp not in seen:
+                seen.add(c.timestamp)
+                result.append(c)
+
+        logger.info("CryptoCompare %s %s: %d candele scaricate.", self.symbol, timeframe, len(result))
         return result
 
     def _cache_db_path(self) -> str:

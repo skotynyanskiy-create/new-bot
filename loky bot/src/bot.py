@@ -613,8 +613,12 @@ class LokyBot:
         """
         Raccoglie il segnale dal FundingRateEngine (async — richiede chiamata REST).
         Chiamato separatamente da on_candle ogni N candle per non rallentare il loop.
+        Rispetta il regime: in CHOPPY nessun trade ammesso, funding incluso.
         """
         if not self._indicators.ready():
+            return None
+        # Regime check: CHOPPY = nessun trade, funding incluso
+        if not self._aggregator.preferred_strategies():
             return None
         try:
             sig = await self._funding_rate.detect(self._candles)
@@ -875,7 +879,33 @@ class LokyBot:
         task.add_done_callback(_on_done)
 
     async def close(self) -> None:
-        """Chiude le sessioni HTTP interne e cancella task pending."""
+        """
+        Shutdown graceful: chiude posizioni aperte, persiste stato, cleanup.
+        """
+        # 1. Se posizione aperta, chiudi a mercato (live) o logga warning (paper)
+        if self._position_size > _ZERO and self._position_side is not None:
+            if self._cfg.live_trading_enabled:
+                logger.critical(
+                    "%s SHUTDOWN: posizione aperta %s %.3f — chiusura a mercato.",
+                    self.symbol, self._position_side.name, self._position_size,
+                )
+                try:
+                    await self._exit_position_market("emergency_shutdown")
+                except Exception as e:
+                    logger.error("%s Errore chiusura emergenza: %s", self.symbol, e)
+            else:
+                logger.warning(
+                    "%s SHUTDOWN: posizione aperta %s %.3f (paper — nessun ordine inviato).",
+                    self.symbol, self._position_side.name, self._position_size,
+                )
+
+        # 2. Persisti stato finale (incluso position state per recovery)
+        try:
+            await self._save_state()
+        except Exception as e:
+            logger.error("%s Errore save state finale: %s", self.symbol, e)
+
+        # 3. Cleanup task e sessioni
         for task in self._pending_tasks:
             task.cancel()
         if self._pending_tasks:
@@ -1495,8 +1525,24 @@ class LokyBot:
         if snap:
             self.realized_pnl = snap.get("pnl", _ZERO)
             self.total_trades  = snap.get("fills_total", 0)
-            logger.info("%s [Loky] Stato caricato: PnL=%.4f USDT, trade=%d",
-                        self.symbol, self.realized_pnl, self.total_trades)
+
+            # Ripristino posizione: se net_inventory != 0, il bot aveva una posizione aperta
+            inv = snap.get("net_inventory", _ZERO)
+            avg_entry = snap.get("avg_entry", _ZERO)
+            if inv != _ZERO and avg_entry > _ZERO:
+                self._position_size = abs(inv)
+                self._position_size_orig = abs(inv)
+                self._position_side = Side.BUY if inv > _ZERO else Side.SELL
+                self._entry_price = avg_entry
+                self._state = BotState.POSITION_OPEN
+                logger.warning(
+                    "%s [Loky] POSIZIONE RIPRISTINATA: %s %.3f @ %.4f — "
+                    "Il bot continuerà a gestire questa posizione.",
+                    self.symbol, self._position_side.name, self._position_size, avg_entry,
+                )
+            else:
+                logger.info("%s [Loky] Stato caricato: PnL=%.4f USDT, trade=%d (FLAT)",
+                            self.symbol, self.realized_pnl, self.total_trades)
 
     # ------------------------------------------------------------------
     # Anti-martingale sizing

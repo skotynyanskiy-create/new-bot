@@ -300,33 +300,32 @@ class SignalAggregator:
     # ------------------------------------------------------------------
 
     def record_trade_result(self, strategy_name: str, pnl: Decimal) -> None:
-        """
-        Registra il risultato di un trade per una strategia.
-        Usato per calcolare i pesi adattivi delle strategie.
-        """
+        """Registra il risultato di un trade per una strategia."""
         if strategy_name not in self._strategy_stats:
-            self._strategy_stats[strategy_name] = {"wins": 0, "losses": 0, "pnl": _ZERO}
+            self._strategy_stats[strategy_name] = {
+                "wins": 0, "losses": 0, "pnl": _ZERO,
+                "total_win_pnl": _ZERO, "total_loss_pnl": _ZERO,
+            }
 
         stats = self._strategy_stats[strategy_name]
         stats["pnl"] += pnl
         if pnl > _ZERO:
             stats["wins"] += 1
+            stats["total_win_pnl"] += pnl
         else:
             stats["losses"] += 1
+            stats["total_loss_pnl"] += abs(pnl)
 
-        # Ricalcola pesi
         self._update_strategy_weights()
 
     def _update_strategy_weights(self) -> None:
         """
-        Ricalcola i pesi adattivi per ogni strategia basandosi su performance.
+        Pesi adattivi basati su EXPECTANCY reale, non solo win rate.
 
-        Logica:
-          - Win rate > 55% → peso 1.2 (boost)
-          - Win rate 40-55% → peso 1.0 (neutro)
-          - Win rate < 40% → peso 0.7 (penalità)
-          - PnL negativo cumulativo → peso 0.6 (forte penalità)
-          - Meno di 5 trade → peso 1.0 (dati insufficienti)
+        E[X] = (win_rate × avg_win) - (loss_rate × avg_loss)
+
+        Una strategia con 60% WR ma avg_win < avg_loss ha E[X] negativo
+        e viene penalizzata, anche se vince più spesso di quanto perde.
         """
         for name, stats in self._strategy_stats.items():
             total = stats["wins"] + stats["losses"]
@@ -335,20 +334,28 @@ class SignalAggregator:
                 continue
 
             win_rate = Decimal(stats["wins"]) / Decimal(total)
+            loss_rate = _ONE - win_rate
 
-            if stats["pnl"] < _ZERO:
-                weight = Decimal('0.6')
-            elif win_rate > Decimal('0.55'):
-                weight = Decimal('1.2')
-            elif win_rate >= Decimal('0.40'):
-                weight = _ONE
+            avg_win = stats["total_win_pnl"] / Decimal(max(stats["wins"], 1))
+            avg_loss = stats["total_loss_pnl"] / Decimal(max(stats["losses"], 1))
+
+            expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
+
+            # Peso basato su expectancy (non win rate)
+            if expectancy > avg_win * Decimal('0.3'):
+                weight = Decimal('1.3')    # expectancy forte
+            elif expectancy > _ZERO:
+                weight = Decimal('1.1')    # expectancy positiva
+            elif expectancy > -(avg_loss * Decimal('0.1')):
+                weight = _ONE              # circa breakeven
             else:
-                weight = Decimal('0.7')
+                weight = Decimal('0.5')    # expectancy negativa → penalizza
 
             self._strategy_weight_cache[name] = weight
             logger.debug(
-                "Strategy weight: %s → %.1f (WR=%.0f%% PnL=%.2f trades=%d)",
-                name, float(weight), float(win_rate * 100), float(stats["pnl"]), total,
+                "Strategy weight: %s → %.1f (E[X]=%.2f WR=%.0f%% avgW=%.2f avgL=%.2f n=%d)",
+                name, float(weight), float(expectancy),
+                float(win_rate * 100), float(avg_win), float(avg_loss), total,
             )
 
     def strategy_weight(self, strategy_name: str) -> Decimal:

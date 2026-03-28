@@ -694,10 +694,11 @@ class TestAdaptiveStrategyWeights:
     def test_winning_strategy_boosted(self):
         from src.strategy.signal_aggregator import SignalAggregator
         agg = SignalAggregator(IndicatorEngine())
-        # Registra 10 trade vincenti per breakout
+        # Registra 10 trade vincenti per breakout (expectancy forte)
         for _ in range(10):
             agg.record_trade_result("breakout", Decimal("5"))
-        assert agg.strategy_weight("breakout") == Decimal("1.2")
+        # Expectancy positiva forte → peso 1.3
+        assert agg.strategy_weight("breakout") == Decimal("1.3")
 
     def test_losing_strategy_penalized(self):
         from src.strategy.signal_aggregator import SignalAggregator

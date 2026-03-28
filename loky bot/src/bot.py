@@ -336,6 +336,9 @@ class LokyBot:
                     await self._close_remaining(candle.close, "gap_protection_2x_sl")
                     return
 
+            # Dynamic TP: estendi target se in forte profitto, stringi se in difficoltà
+            self._update_dynamic_tp(candle)
+
             if not self._cfg.live_trading_enabled:
                 self._update_trailing_sl(candle)
                 await self._check_paper_tp_sl(candle)
@@ -678,6 +681,54 @@ class LokyBot:
     # ------------------------------------------------------------------
     # Trailing stop
     # ------------------------------------------------------------------
+
+    def _update_dynamic_tp(self, candle: Candle) -> None:
+        """
+        Adatta i TP levels al momentum del trade in corso.
+        - Forte profitto pre-TP1 → estendi TP3 (cattura più trend)
+        - Trade stagnante → stringi TP2/TP3 (esci prima)
+        NON tocca TP1 (primo lock è sacro).
+        """
+        if not self._tp_levels or len(self._tp_levels) < 3:
+            return
+        if self._tp_levels[0].hit:
+            return  # Dopo TP1 hit, i target restano fissi (trail gestisce il resto)
+        if self._position_side is None or self._entry_price <= _ZERO:
+            return
+
+        try:
+            atr = self._indicators.atr()
+        except ValueError:
+            return
+
+        is_long = self._position_side == Side.BUY
+        if is_long:
+            profit_pct = (candle.close - self._entry_price) / self._entry_price
+        else:
+            profit_pct = (self._entry_price - candle.close) / self._entry_price
+
+        # Forte profitto (>2%) pre-TP1: estendi TP3 di +0.5×ATR
+        if profit_pct > Decimal('0.02'):
+            if is_long:
+                new_tp3 = self._tp_levels[2].price + atr * Decimal('0.5')
+                if new_tp3 > self._tp_levels[2].price:
+                    self._tp_levels[2] = TPLevel(new_tp3, self._tp_levels[2].qty_fraction)
+            else:
+                new_tp3 = self._tp_levels[2].price - atr * Decimal('0.5')
+                if new_tp3 < self._tp_levels[2].price:
+                    self._tp_levels[2] = TPLevel(new_tp3, self._tp_levels[2].qty_fraction)
+
+        # Trade stagnante (-0.5% a +0.5% per 5+ candle): stringi TP2/TP3 del 15%
+        elif abs(profit_pct) < Decimal('0.005') and self._candle_count > 5:
+            shrink = Decimal('0.85')
+            if is_long:
+                new_tp2 = self._entry_price + (self._tp_levels[1].price - self._entry_price) * shrink
+                new_tp3 = self._entry_price + (self._tp_levels[2].price - self._entry_price) * shrink
+            else:
+                new_tp2 = self._entry_price - (self._entry_price - self._tp_levels[1].price) * shrink
+                new_tp3 = self._entry_price - (self._entry_price - self._tp_levels[2].price) * shrink
+            self._tp_levels[1] = TPLevel(new_tp2, self._tp_levels[1].qty_fraction)
+            self._tp_levels[2] = TPLevel(new_tp3, self._tp_levels[2].qty_fraction)
 
     def _update_trailing_sl(self, candle: Candle) -> None:
         """
@@ -1058,9 +1109,24 @@ class LokyBot:
         atr = signal.atr
         s   = self._cfg.strategy
 
+        # Score-adaptive entry: segnali ad alta confidenza → SL stretto + size boost
+        # Segnali deboli → SL largo + size ridotta (conservativo)
+        score = signal.score
+        if score >= Decimal('85'):
+            sl_score_mult = Decimal('0.8')   # SL stretto: alta confidenza
+            size_score_mult = Decimal('1.15') # Size +15%
+        elif score >= Decimal('70'):
+            sl_score_mult = _ONE              # SL standard
+            size_score_mult = _ONE
+        else:
+            sl_score_mult = Decimal('1.3')   # SL largo: bassa confidenza
+            size_score_mult = Decimal('0.85') # Size -15%
+
+        self._position_size = (self._position_size * size_score_mult).quantize(Decimal('0.001'))
+        self._position_size_orig = self._position_size
+
         # SL su struttura di mercato: il più lontano tra ATR-based e swing structure.
-        # Questo riduce i whipsaw posizionando lo SL sotto/sopra minimi/massimi recenti.
-        atr_sl_distance = s.sl_atr_mult * atr
+        atr_sl_distance = s.sl_atr_mult * atr * sl_score_mult
 
         if side == Side.BUY:
             atr_sl = fill_price - atr_sl_distance

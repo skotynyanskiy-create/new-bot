@@ -816,3 +816,84 @@ class TestTWAPVolumeWeighted:
         from src.state.order_manager import OrderManager as OM
         sig = inspect.signature(OM.place_twap_order)
         assert "volume_weights" in sig.parameters
+
+
+# ================================================================== #
+#  FASE 6 — BACKTESTING AVANZATO                                     #
+# ================================================================== #
+
+class TestMonteCarloSimulation:
+    """Verifica la simulazione Monte Carlo."""
+
+    def test_basic_run(self):
+        from src.backtest_advanced import MonteCarloSimulator
+        pnls = [10.0, -5.0, 15.0, -3.0, 8.0, -2.0, 12.0, -7.0, 6.0, -1.0]
+        mc = MonteCarloSimulator(pnls, capital=500, n_simulations=100)
+        result = mc.run()
+        assert result.n_simulations == 100
+        assert result.prob_profitable > 0  # almeno qualche sim profittevole
+
+    def test_all_wins_high_probability(self):
+        from src.backtest_advanced import MonteCarloSimulator
+        pnls = [5.0] * 20  # tutti trade vincenti
+        mc = MonteCarloSimulator(pnls, capital=500, n_simulations=100)
+        result = mc.run()
+        assert result.prob_profitable == 100.0  # tutte le simulazioni profittevoli
+        assert result.mean_pnl == 100.0  # 20 × 5
+
+    def test_all_losses_zero_probability(self):
+        from src.backtest_advanced import MonteCarloSimulator
+        pnls = [-5.0] * 20  # tutti trade perdenti
+        mc = MonteCarloSimulator(pnls, capital=500, n_simulations=100)
+        result = mc.run()
+        assert result.prob_profitable == 0.0
+
+    def test_empty_pnls(self):
+        from src.backtest_advanced import MonteCarloSimulator
+        mc = MonteCarloSimulator([], capital=500)
+        result = mc.run()
+        assert result.n_simulations == 0
+
+    def test_confidence_interval(self):
+        from src.backtest_advanced import MonteCarloSimulator
+        pnls = [10.0, -5.0, 15.0, -3.0, 8.0] * 10  # 50 trade
+        mc = MonteCarloSimulator(pnls, capital=500, n_simulations=500)
+        result = mc.run()
+        # 5° percentile deve essere < 95° percentile
+        assert result.pct_5_pnl <= result.pct_95_pnl
+        # Mediano deve essere tra i due
+        assert result.pct_5_pnl <= result.median_pnl <= result.pct_95_pnl
+
+
+class TestWalkForwardAnalysis:
+    """Verifica l'analisi walk-forward."""
+
+    def test_basic_run(self):
+        from src.backtest_advanced import WalkForwardAnalyzer
+        pnls = [5.0, -2.0, 8.0, -1.0, 3.0] * 10  # 50 trade
+        wf = WalkForwardAnalyzer(pnls, train_ratio=0.8, n_windows=5)
+        result = wf.run()
+        assert result.n_windows > 0
+        assert len(result.windows) > 0
+
+    def test_robustness_score_range(self):
+        from src.backtest_advanced import WalkForwardAnalyzer
+        pnls = [5.0, -2.0, 8.0, -1.0, 3.0] * 10
+        wf = WalkForwardAnalyzer(pnls, n_windows=5)
+        result = wf.run()
+        assert 0 <= result.robustness_score <= 100
+
+    def test_insufficient_data(self):
+        from src.backtest_advanced import WalkForwardAnalyzer
+        pnls = [5.0, -2.0]  # troppo pochi trade
+        wf = WalkForwardAnalyzer(pnls, n_windows=5)
+        result = wf.run()
+        assert result.n_windows == 0
+
+    def test_profitable_windows_tracked(self):
+        from src.backtest_advanced import WalkForwardAnalyzer
+        # Trade tutti vincenti → tutte le finestre profittevoli
+        pnls = [10.0] * 50
+        wf = WalkForwardAnalyzer(pnls, n_windows=5)
+        result = wf.run()
+        assert result.pct_profitable_windows == 100.0

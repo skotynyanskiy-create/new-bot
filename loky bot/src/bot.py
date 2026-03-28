@@ -43,6 +43,7 @@ from src.strategy.indicator_engine import IndicatorEngine
 from src.strategy.market_sentiment_engine import MarketSentimentEngine
 from src.strategy.mean_reversion_engine import MeanReversionEngine
 from src.strategy.signal_aggregator import SignalAggregator
+from src.strategy.volatility_engine import VolatilityRegimeEngine
 from src.strategy.trend_following_engine import TrendFollowingEngine
 
 logger = logging.getLogger(__name__)
@@ -167,7 +168,12 @@ class LokyBot:
         self._sentiment     = MarketSentimentEngine(testnet=config.testnet)
 
         # --- Signal scoring ---
-        self._aggregator = SignalAggregator(self._indicators, self._htf_indicators)
+        self._aggregator = SignalAggregator(
+            self._indicators, self._htf_indicators, self._macro_indicators
+        )
+
+        # --- Volatility regime ---
+        self._vol_engine = VolatilityRegimeEngine(self._indicators)
 
         # --- Kelly Criterion sizing ---
         self._kelly = KellySizer(
@@ -266,6 +272,7 @@ class LokyBot:
         self._indicators.update(candle)
         self._candle_count += 1
         self._last_price = candle.close
+        self._vol_engine.update()  # aggiorna volatility regime
 
         # Registra ATR per leva dinamica
         if self._portfolio_risk is not None:
@@ -391,6 +398,11 @@ class LokyBot:
         best = self._aggregator.select_best(signals)
         if best is None:
             return
+
+        # Volatility regime modifier: penalizza in CONTRACTION, premia in COMPRESSION
+        vol_mod = self._vol_engine.score_modifier()
+        if vol_mod != Decimal('1'):
+            best.score = min(best.score * vol_mod, Decimal('100')).quantize(Decimal('0.1'))
 
         # --- Filtro sentiment (OI + L/S ratio) ---
         # 1. Blocco esplicito basato su flag block_long/block_short (contrarian estremo)
@@ -1122,6 +1134,8 @@ class LokyBot:
         self.trades_by_strategy[strategy_name] = (
             self.trades_by_strategy.get(strategy_name, 0) + 1
         )
+        # Aggiorna pesi adattivi per strategia nell'aggregator
+        self._aggregator.record_trade_result(strategy_name, total_pnl_trade)
 
         if _prom:
             result_label = "win" if total_pnl_trade > _ZERO else "loss"

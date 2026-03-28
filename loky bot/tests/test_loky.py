@@ -658,3 +658,87 @@ class TestVolatilityAdjustedDailyStop:
         base = arm._max_daily_loss
         arm.adjust_daily_stop_for_volatility(Decimal("0.50"))  # vol media
         assert arm._max_daily_loss == base
+
+
+# ================================================================== #
+#  FASE 4 — STRATEGIE AVANZATE                                       #
+# ================================================================== #
+
+class TestSignalAggregatorImprovements:
+    """Verifica miglioramenti al signal aggregator."""
+
+    def test_volume_bonus_logarithmic(self):
+        """Volume bonus deve seguire scala logaritmica."""
+        import math
+        # vol_ratio 2.0 → log2(2) × 4 = 4.0
+        vol_ratio = 2.0
+        log_vol = math.log2(vol_ratio) * 4
+        assert abs(log_vol - 4.0) < 0.01
+
+        # vol_ratio 0.5 → log2(0.5) × 4 = -4.0
+        vol_ratio = 0.5
+        log_vol = math.log2(vol_ratio) * 4
+        assert abs(log_vol - (-4.0)) < 0.01
+
+    def test_aggregator_with_macro_indicators(self):
+        """SignalAggregator accetta macro_indicators."""
+        from src.strategy.signal_aggregator import SignalAggregator
+        ind = IndicatorEngine()
+        agg = SignalAggregator(ind, htf_indicators=None, macro_indicators=None)
+        assert agg._macro_ind is None
+
+
+class TestAdaptiveStrategyWeights:
+    """Verifica pesi adattivi per strategia."""
+
+    def test_winning_strategy_boosted(self):
+        from src.strategy.signal_aggregator import SignalAggregator
+        agg = SignalAggregator(IndicatorEngine())
+        # Registra 10 trade vincenti per breakout
+        for _ in range(10):
+            agg.record_trade_result("breakout", Decimal("5"))
+        assert agg.strategy_weight("breakout") == Decimal("1.2")
+
+    def test_losing_strategy_penalized(self):
+        from src.strategy.signal_aggregator import SignalAggregator
+        agg = SignalAggregator(IndicatorEngine())
+        # Registra 8 trade perdenti su 10 per mean_reversion
+        for _ in range(8):
+            agg.record_trade_result("mean_reversion", Decimal("-3"))
+        for _ in range(2):
+            agg.record_trade_result("mean_reversion", Decimal("2"))
+        assert agg.strategy_weight("mean_reversion") <= Decimal("0.7")
+
+    def test_unknown_strategy_default_weight(self):
+        from src.strategy.signal_aggregator import SignalAggregator
+        agg = SignalAggregator(IndicatorEngine())
+        assert agg.strategy_weight("nonexistent") == Decimal("1")
+
+    def test_insufficient_data_neutral_weight(self):
+        from src.strategy.signal_aggregator import SignalAggregator
+        agg = SignalAggregator(IndicatorEngine())
+        agg.record_trade_result("test", Decimal("10"))  # solo 1 trade
+        assert agg.strategy_weight("test") == Decimal("1")
+
+
+class TestVolatilityRegimeEngine:
+    """Verifica il Volatility Regime Engine."""
+
+    def test_normal_regime_with_insufficient_data(self):
+        from src.strategy.volatility_engine import VolatilityRegimeEngine, VolatilityRegime
+        ind = IndicatorEngine()
+        engine = VolatilityRegimeEngine(ind)
+        # Senza dati → NORMAL
+        assert engine.detect() == VolatilityRegime.NORMAL
+
+    def test_score_modifier_normal(self):
+        from src.strategy.volatility_engine import VolatilityRegimeEngine
+        ind = IndicatorEngine()
+        engine = VolatilityRegimeEngine(ind)
+        assert engine.score_modifier() == Decimal("1.00")
+
+    def test_regime_name_property(self):
+        from src.strategy.volatility_engine import VolatilityRegimeEngine
+        ind = IndicatorEngine()
+        engine = VolatilityRegimeEngine(ind)
+        assert engine.regime_name == "normal"

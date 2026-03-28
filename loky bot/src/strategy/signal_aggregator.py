@@ -63,9 +63,16 @@ class SignalAggregator:
         self,
         indicators: IndicatorEngine,
         htf_indicators: Optional[IndicatorEngine] = None,
+        macro_indicators: Optional[IndicatorEngine] = None,
     ) -> None:
-        self._ind     = indicators
-        self._htf_ind = htf_indicators
+        self._ind       = indicators
+        self._htf_ind   = htf_indicators
+        self._macro_ind = macro_indicators
+
+        # Adaptive strategy weights: traccia performance rolling per strategia
+        # {strategy_name: {"wins": int, "losses": int, "pnl": Decimal}}
+        self._strategy_stats: dict[str, dict] = {}
+        self._strategy_weight_cache: dict[str, Decimal] = {}
 
     # ------------------------------------------------------------------
     # Regime detection
@@ -127,38 +134,73 @@ class SignalAggregator:
         except ValueError:
             adx_normalized = _ZERO
 
-        # Bonus volume: volume sopra la media → conferma del segnale
+        # Bonus volume: scala logaritmica continua (non step discreti)
+        # log2(vol_ratio) × 4, capped [-4, +10]
+        # 0.5x → -4, 1.0x → 0, 1.5x → +2.3, 2.0x → +4, 3.0x → +6.3, 4.0x → +8
         try:
             vol_ratio = self._ind.volume_ratio()
-            # Volume > 1.5× media → +5, > 2× → +8, < 0.5× → -3
-            if vol_ratio >= Decimal('2.0'):
-                vol_bonus = Decimal('8')
-            elif vol_ratio >= Decimal('1.5'):
-                vol_bonus = Decimal('5')
-            elif vol_ratio < Decimal('0.5'):
-                vol_bonus = Decimal('-3')
+            if vol_ratio > _ZERO:
+                import math
+                log_vol = Decimal(str(math.log2(max(float(vol_ratio), 0.25))))
+                vol_bonus = max(Decimal('-4'), min(log_vol * Decimal('4'), Decimal('10')))
             else:
-                vol_bonus = _ZERO
-        except ValueError:
+                vol_bonus = Decimal('-4')
+        except (ValueError, OverflowError):
             vol_bonus = _ZERO
 
-        # HTF alignment bonus
+        # HTF alignment: gradiente basato su distanza EMA (non binario)
+        # Misura quanto forte è l'allineamento HTF: da -8 (forte contrario) a +10 (forte allineato)
         htf_bonus = _ZERO
         if self._htf_ind is not None:
             try:
                 htf_fast = self._htf_ind.ema_fast()
                 htf_slow = self._htf_ind.ema_slow()
-                if signal.signal_type == SignalType.LONG and htf_fast > htf_slow:
-                    htf_bonus = Decimal('8')
-                elif signal.signal_type == SignalType.SHORT and htf_fast < htf_slow:
-                    htf_bonus = Decimal('8')
-                else:
-                    htf_bonus = Decimal('-5')  # HTF contrario = penalità
+                if htf_slow > _ZERO:
+                    # Distanza normalizzata EMA fast vs slow (% del prezzo)
+                    ema_spread = (htf_fast - htf_slow) / htf_slow
+                    # Per LONG: spread positivo = allineato, negativo = contrario
+                    # Per SHORT: invertito
+                    if signal.signal_type == SignalType.SHORT:
+                        ema_spread = -ema_spread
+                    # Scala: 0.5% spread → +5, 1% → +8, 2%+ → +10, -0.5% → -5
+                    htf_bonus = min(ema_spread * Decimal('1000'), Decimal('10'))
+                    htf_bonus = max(htf_bonus, Decimal('-8'))
             except ValueError:
                 pass
 
-        final_score = min(base + adx_normalized + vol_bonus + htf_bonus, _HUNDRED)
-        return final_score.quantize(Decimal('0.1'))
+        # Multi-Timeframe Confluence: bonus se macro (4h) è allineato
+        macro_bonus = _ZERO
+        tf_aligned = 1  # primary TF è sempre "allineato" (ha generato il segnale)
+        if htf_bonus > _ZERO:
+            tf_aligned += 1  # HTF (1h) allineato
+        if self._macro_ind is not None:
+            try:
+                macro_fast = self._macro_ind.ema_fast()
+                macro_slow = self._macro_ind.ema_slow()
+                if macro_slow > _ZERO:
+                    macro_spread = (macro_fast - macro_slow) / macro_slow
+                    if signal.signal_type == SignalType.SHORT:
+                        macro_spread = -macro_spread
+                    if macro_spread > Decimal('0.001'):  # >0.1% = allineato
+                        macro_bonus = Decimal('5')
+                        tf_aligned += 1
+                    elif macro_spread < Decimal('-0.001'):  # contrario
+                        macro_bonus = Decimal('-5')
+            except ValueError:
+                pass
+
+        # Confluence multiplier: 3 TF allineati → bonus extra
+        confluence_bonus = _ZERO
+        if tf_aligned >= 3:
+            confluence_bonus = Decimal('5')  # triple confluence bonus
+        elif tf_aligned < 2:
+            confluence_bonus = Decimal('-3')  # solo 1 TF: penalità
+
+        # Adaptive strategy weight: penalizza/premia in base a performance storica
+        strat_weight = self.strategy_weight(signal.strategy_name)
+        raw_score = base + adx_normalized + vol_bonus + htf_bonus + macro_bonus + confluence_bonus
+        final_score = min(raw_score * strat_weight, _HUNDRED)
+        return max(_ZERO, final_score).quantize(Decimal('0.1'))
 
     # ------------------------------------------------------------------
     # Selezione migliore
@@ -208,6 +250,66 @@ class SignalAggregator:
     # ------------------------------------------------------------------
     # Helper regime → strategie consigliate
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Adaptive strategy weights
+    # ------------------------------------------------------------------
+
+    def record_trade_result(self, strategy_name: str, pnl: Decimal) -> None:
+        """
+        Registra il risultato di un trade per una strategia.
+        Usato per calcolare i pesi adattivi delle strategie.
+        """
+        if strategy_name not in self._strategy_stats:
+            self._strategy_stats[strategy_name] = {"wins": 0, "losses": 0, "pnl": _ZERO}
+
+        stats = self._strategy_stats[strategy_name]
+        stats["pnl"] += pnl
+        if pnl > _ZERO:
+            stats["wins"] += 1
+        else:
+            stats["losses"] += 1
+
+        # Ricalcola pesi
+        self._update_strategy_weights()
+
+    def _update_strategy_weights(self) -> None:
+        """
+        Ricalcola i pesi adattivi per ogni strategia basandosi su performance.
+
+        Logica:
+          - Win rate > 55% → peso 1.2 (boost)
+          - Win rate 40-55% → peso 1.0 (neutro)
+          - Win rate < 40% → peso 0.7 (penalità)
+          - PnL negativo cumulativo → peso 0.6 (forte penalità)
+          - Meno di 5 trade → peso 1.0 (dati insufficienti)
+        """
+        for name, stats in self._strategy_stats.items():
+            total = stats["wins"] + stats["losses"]
+            if total < 5:
+                self._strategy_weight_cache[name] = _ONE
+                continue
+
+            win_rate = Decimal(stats["wins"]) / Decimal(total)
+
+            if stats["pnl"] < _ZERO:
+                weight = Decimal('0.6')
+            elif win_rate > Decimal('0.55'):
+                weight = Decimal('1.2')
+            elif win_rate >= Decimal('0.40'):
+                weight = _ONE
+            else:
+                weight = Decimal('0.7')
+
+            self._strategy_weight_cache[name] = weight
+            logger.debug(
+                "Strategy weight: %s → %.1f (WR=%.0f%% PnL=%.2f trades=%d)",
+                name, float(weight), float(win_rate * 100), float(stats["pnl"]), total,
+            )
+
+    def strategy_weight(self, strategy_name: str) -> Decimal:
+        """Ritorna il peso adattivo per una strategia (default 1.0)."""
+        return self._strategy_weight_cache.get(strategy_name, _ONE)
 
     def preferred_strategies(self) -> list[str]:
         """

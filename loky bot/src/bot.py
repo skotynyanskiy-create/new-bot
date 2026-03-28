@@ -1152,21 +1152,11 @@ class LokyBot:
         # SL su struttura di mercato (score_mult per confidenza + risk_mult per regime)
         atr_sl_distance = s.sl_atr_mult * atr * sl_score_mult * risk_mult
 
+        # SL: usa solo ATR-based (coerente, prevedibile)
         if side == Side.BUY:
-            atr_sl = fill_price - atr_sl_distance
-            try:
-                swing_sl = self._indicators.recent_swing_low(5) * Decimal('0.999')  # -0.1% buffer
-                # Usa il più lontano (conservativo) tra i due SL
-                self._sl_price = min(atr_sl, swing_sl)
-            except ValueError:
-                self._sl_price = atr_sl
+            self._sl_price = fill_price - atr_sl_distance
         else:
-            atr_sl = fill_price + atr_sl_distance
-            try:
-                swing_sl = self._indicators.recent_swing_high(5) * Decimal('1.001')  # +0.1% buffer
-                self._sl_price = max(atr_sl, swing_sl)
-            except ValueError:
-                self._sl_price = atr_sl
+            self._sl_price = fill_price + atr_sl_distance
         self._sl_price_orig = self._sl_price
 
         # 3 livelli di Partial TP (risk_mult già calcolato sopra — R:R preservato)

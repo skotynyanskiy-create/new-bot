@@ -26,9 +26,9 @@ strategy:
   vol_period: 20
   tp_atr_mult: 2.0
   sl_atr_mult: 1.0
-  max_hold_hours: 8
+  max_hold_hours: 12
   trailing_stop_enabled: true
-  trail_atr_mult: 0.5
+  trail_atr_mult: 0.6
   loss_cooldown_candles: 3
 
   # --- ADX & Regime ---
@@ -47,8 +47,8 @@ strategy:
 
   # --- Trend Following (EMA ribbon, ADX > 28, pullback) ---
   tf_adx_min: 28
-  tf_tp_atr_mult: 3.0            # R:R 3:1
-  tf_sl_atr_mult: 1.2
+  tf_tp_atr_mult: 3.5            # R:R ~4:1
+  tf_sl_atr_mult: 1.0            # SL ATR standard
 
   # --- Funding Rate Harvesting ---
   funding_threshold: 0.0008      # 0.08% per 8h = attiva harvest
@@ -62,7 +62,7 @@ strategy:
   partial_tp3_pct: 0.25
 
   # --- Signal Scoring ---
-  min_signal_score: 50           # score < 50 → segnale scartato
+  min_signal_score: 62           # score < 62 → segnale scartato (alta selettività)
 
   # --- Circuit Breaker ---
   circuit_breaker_losses: 3      # N perdite consecutive → attiva pausa automatica
@@ -75,7 +75,7 @@ strategy:
 risk_per_trade_pct: 0.015        # 1.5% del capitale per trade (Kelly override se attivo)
 max_concurrent_positions: 2
 leverage: 3                      # Leva base (override dinamico se dynamic_leverage_enabled)
-max_daily_loss_pct: 0.05         # 5% del capitale = daily stop (scala col capitale)
+max_daily_loss_pct: 0.03         # 3% del capitale = daily stop più stretto
 max_position_per_asset: 0.05
 
 # === PORTFOLIO & LEVA DINAMICA ===

@@ -1,0 +1,116 @@
+# Multi-Strategy Bot — Bybit USDT-M Linear Perpetual
+# ATTENZIONE: Impostare live_trading_enabled: true solo con API keys verificate
+# e dopo almeno 48h di paper trading positivo.
+
+# === COPPIE E TIMEFRAME ===
+tokens:
+  - "BTCUSDT"
+  - "ETHUSDT"
+  - "SOLUSDT"
+  - "AVAXUSDT"
+
+primary_timeframe: "15m"
+confirmation_timeframe: "1h"
+macro_timeframe: "4h"          # Filtro macro trend (4h): blocca operazioni contro il trend
+
+# === STRATEGIA MULTI-ENGINE ===
+strategy:
+  # --- Breakout/Momentum ---
+  breakout_lookback: 20
+  volume_multiplier: 1.5
+  rsi_min: 45
+  rsi_max: 72
+  ema_fast: 20
+  ema_slow: 50
+  atr_period: 14
+  vol_period: 20
+  tp_atr_mult: 2.0
+  sl_atr_mult: 1.0
+  max_hold_hours: 8
+  trailing_stop_enabled: true
+  trail_atr_mult: 0.5
+  loss_cooldown_candles: 3
+
+  # --- ADX & Regime ---
+  adx_period: 14
+  adx_trending_threshold: 25     # ADX > 25 → TRENDING
+  adx_ranging_threshold: 20      # ADX < 20 → RANGING
+
+  # --- Bollinger Bands ---
+  bb_period: 20
+  bb_std: 2.0
+
+  # --- Mean Reversion (ADX < 22, BB touch, RSI ipervenduto) ---
+  mr_rsi_oversold: 32
+  mr_rsi_overbought: 68
+  mr_adx_max: 22
+
+  # --- Trend Following (EMA ribbon, ADX > 28, pullback) ---
+  tf_adx_min: 28
+  tf_tp_atr_mult: 3.0            # R:R 3:1
+  tf_sl_atr_mult: 1.2
+
+  # --- Funding Rate Harvesting ---
+  funding_threshold: 0.0008      # 0.08% per 8h = attiva harvest
+
+  # --- Partial TP (50% TP1, 25% TP2, 25% trail) ---
+  partial_tp1_atr: 1.5
+  partial_tp2_atr: 2.5
+  partial_tp3_atr: 4.0
+  partial_tp1_pct: 0.50
+  partial_tp2_pct: 0.25
+  partial_tp3_pct: 0.25
+
+  # --- Signal Scoring ---
+  min_signal_score: 50           # score < 50 → segnale scartato
+
+  # --- Circuit Breaker ---
+  circuit_breaker_losses: 3      # N perdite consecutive → attiva pausa automatica
+  circuit_breaker_candles: 15    # candle di pausa dopo attivazione circuit breaker
+
+  # --- Regime avanzato ---
+  choppy_market_pause: true      # ADX < 15 = mercato choppy → nessun trade
+
+# === RISK MANAGEMENT ===
+risk_per_trade_pct: 0.015        # 1.5% del capitale per trade (Kelly override se attivo)
+max_concurrent_positions: 2
+leverage: 3                      # Leva base (override dinamico se dynamic_leverage_enabled)
+max_daily_loss: -30.0            # Stop loss giornaliero in USDT
+max_position_per_asset: 0.05
+
+# === PORTFOLIO & LEVA DINAMICA ===
+max_leverage: 5                  # Leva massima account (hard cap)
+dynamic_leverage_enabled: true   # Leva adattiva su volatilità ATR
+kelly_sizing_enabled: true       # Kelly Criterion sizing (attivo dopo kelly_min_trades)
+kelly_min_trades: 20             # Trade minimi prima di attivare Kelly
+
+# === BYBIT FUTURES FEES (Standard Tier) ===
+fee_maker: 0.0002                # 0.02%
+fee_taker: 0.0004                # 0.04%
+
+# === CORRELATION GROUPS ===
+# Coppie correlate: se una è aperta, le altre nello stesso gruppo sono bloccate.
+# Modifica qui senza toccare il codice Python.
+correlation_groups:
+  - ["BTCUSDT", "ETHUSDT"]
+  - ["SOLUSDT", "AVAXUSDT"]
+
+# === EXCHANGE E LIVE TRADING ===
+exchange: "bybit"
+
+# Modalità disponibili:
+#   1. Paper trading (default):  live_trading_enabled: false
+#   2. Testnet demo:             live_trading_enabled: true  + testnet: true
+#   3. Live reale:               live_trading_enabled: true  + testnet: false
+live_trading_enabled: false
+testnet: false
+rate_limit_rps: 8
+next_candle_entry: true          # Entry al open della candela successiva
+slippage_pct: 0.0005             # 0.05% slippage simulato in paper/backtest
+
+# === LIMIT ENTRY (riduce fee da taker 0.04% a maker 0.02%) ===
+limit_entry_enabled: true        # Usa limit order con fallback a market
+limit_entry_timeout_s: 5.0       # Secondi di attesa prima di fallback a market
+
+# === PEAK DRAWDOWN PROTECTION ===
+max_peak_drawdown_pct: 0.15      # 15% drawdown da equity peak → stop non resettabile

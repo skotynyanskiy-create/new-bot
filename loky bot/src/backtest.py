@@ -28,6 +28,7 @@ import csv
 import json
 import logging
 import math
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -45,6 +46,24 @@ logger = logging.getLogger(__name__)
 # Bybit V5 REST endpoint
 _BYBIT_REST = "https://api.bybit.com"
 _BYBIT_KLINE_PATH = "/v5/market/kline"
+
+# OKX fallback (se Bybit bloccato)
+_OKX_REST = "https://www.okx.com"
+_OKX_KLINE_PATH = "/api/v5/market/candles"
+
+# OKX interval map
+_OKX_TF_MAP = {
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1h": "1H", "2h": "2H", "4h": "4H", "6h": "6H", "12h": "12H",
+    "1d": "1D", "1w": "1W",
+}
+
+# OKX symbol map (Bybit "BTCUSDT" → OKX "BTC-USDT")
+def _to_okx_symbol(symbol: str) -> str:
+    if symbol.endswith("USDT"):
+        base = symbol[:-4]
+        return f"{base}-USDT"
+    return symbol
 
 # Mappa timeframe → Bybit interval string
 _TF_MAP = {
@@ -299,6 +318,7 @@ class CandleBacktestEngine:
         start_ms = end_ms - self.days * 86_400 * 1000
         limit    = 1000
         candles: List[Candle] = []
+        proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
 
         async with aiohttp.ClientSession() as session:
             cur_end = end_ms
@@ -316,6 +336,7 @@ class CandleBacktestEngine:
                         f"{_BYBIT_REST}{_BYBIT_KLINE_PATH}",
                         params=params,
                         timeout=aiohttp.ClientTimeout(total=20),
+                        proxy=proxy,
                     ) as resp:
                         resp.raise_for_status()
                         data = await resp.json()
@@ -374,6 +395,11 @@ class CandleBacktestEngine:
             "Bybit %s %s: %d candele scaricate.", self.symbol, timeframe, len(result)
         )
 
+        # Fallback a OKX se Bybit non ha restituito dati
+        if not result:
+            logger.warning("Bybit fallito per %s %s — provo OKX come fallback...", self.symbol, timeframe)
+            result = await self._fetch_candles_okx(timeframe)
+
         # Salva in cache locale
         if result:
             self._save_to_cache(timeframe, result)
@@ -383,6 +409,87 @@ class CandleBacktestEngine:
     # ------------------------------------------------------------------
     # Cache SQLite locale per dati storici
     # ------------------------------------------------------------------
+
+    async def _fetch_candles_okx(self, timeframe: str) -> List[Candle]:
+        """
+        Fallback: scarica dati storici da OKX /api/v5/market/candles.
+        OKX ritorna max 100 candle per request, dal più recente al più vecchio.
+        """
+        okx_interval = _OKX_TF_MAP.get(timeframe, "15m")
+        okx_symbol = _to_okx_symbol(self.symbol)
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - self.days * 86_400 * 1000
+        candles: List[Candle] = []
+
+        # Usa proxy da env se disponibile (per ambienti con firewall)
+        proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+
+        async with aiohttp.ClientSession() as session:
+            cur_end = end_ms
+            while True:
+                params = {
+                    "instId": okx_symbol,
+                    "bar": okx_interval,
+                    "after": str(cur_end),
+                    "limit": "100",
+                }
+                try:
+                    async with session.get(
+                        f"{_OKX_REST}{_OKX_KLINE_PATH}",
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=15),
+                        proxy=proxy,
+                    ) as resp:
+                        data = await resp.json()
+                except Exception as e:
+                    logger.error("OKX fetch fallito %s %s: %s", self.symbol, timeframe, e)
+                    break
+
+                if data.get("code") != "0":
+                    logger.error("OKX errore: %s", data.get("msg"))
+                    break
+
+                rows = data.get("data", [])
+                if not rows:
+                    break
+
+                # OKX: [ts_ms, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
+                for row in rows:
+                    ts_ms = int(row[0])
+                    if ts_ms < start_ms:
+                        continue
+                    confirmed = row[8] if len(row) > 8 else "1"
+                    if confirmed != "1":
+                        continue
+                    candles.append(Candle(
+                        symbol=self.symbol,
+                        timeframe=timeframe,
+                        open=Decimal(str(row[1])),
+                        high=Decimal(str(row[2])),
+                        low=Decimal(str(row[3])),
+                        close=Decimal(str(row[4])),
+                        volume=Decimal(str(row[5])),
+                        timestamp=ts_ms / 1000.0,
+                        is_closed=True,
+                    ))
+
+                # OKX ritorna dal più recente: l'ultimo elemento è il più vecchio
+                oldest_ts = int(rows[-1][0])
+                if oldest_ts <= start_ms:
+                    break
+                cur_end = oldest_ts
+                await asyncio.sleep(0.15)
+
+        # Deduplica e ordina
+        seen: set = set()
+        result: List[Candle] = []
+        for c in sorted(candles, key=lambda x: x.timestamp):
+            if c.timestamp not in seen:
+                seen.add(c.timestamp)
+                result.append(c)
+
+        logger.info("OKX %s %s: %d candele scaricate.", self.symbol, timeframe, len(result))
+        return result
 
     def _cache_db_path(self) -> str:
         return f"data/backtest_cache_{self.symbol}.db"

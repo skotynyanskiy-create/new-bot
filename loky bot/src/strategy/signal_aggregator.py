@@ -270,6 +270,19 @@ class SignalAggregator:
                 continue
             # Applica moltiplicatore size in base a regime + score
             regime = self.detect_regime()
+
+            # Regime-aware score adjustment: penalizza strategie inadatte al regime
+            if regime == "NEUTRAL" or regime == "RANGING":
+                if sig.strategy_name == "breakout":
+                    final_score = final_score * Decimal('0.85')  # Breakout penalizzato in range
+                elif sig.strategy_name == "mean_reversion":
+                    final_score = final_score * Decimal('1.15')  # MR premiato in range
+            elif regime in ("TRENDING", "STRONG_TREND"):
+                if sig.strategy_name == "mean_reversion":
+                    final_score = final_score * Decimal('0.80')  # MR penalizzato in trend
+                elif sig.strategy_name == "trend_following":
+                    final_score = final_score * Decimal('1.10')  # TF premiato in trend
+
             if regime == "STRONG_TREND" and final_score >= _SCORE_STRONG:
                 sig.size = (sig.size * _SIZE_MULT_STRONG_TREND).quantize(Decimal('0.001'))
             elif final_score >= _SCORE_STRONG:

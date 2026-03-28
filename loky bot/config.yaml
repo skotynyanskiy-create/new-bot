@@ -72,7 +72,7 @@ strategy:
   # choppy_market_pause rimosso — gestito da is_choppy_market() nell'aggregator
 
 # === RISK MANAGEMENT ===
-risk_per_trade_pct: 0.015        # 1.5% del capitale per trade (Kelly override se attivo)
+risk_per_trade_pct: 0.01         # 1.0% del capitale per trade (conservativo)
 max_concurrent_positions: 2
 leverage: 3                      # Leva base (override dinamico se dynamic_leverage_enabled)
 max_daily_loss_pct: 0.06         # 6% del capitale = daily stop
@@ -81,7 +81,7 @@ max_position_per_asset: 0.05
 # === PORTFOLIO & LEVA DINAMICA ===
 max_leverage: 5                  # Leva massima account (hard cap)
 dynamic_leverage_enabled: true   # Leva adattiva su volatilità ATR
-kelly_sizing_enabled: true       # Kelly Criterion sizing (attivo dopo kelly_min_trades)
+kelly_sizing_enabled: false      # Disabilitato: sizing uniforme finché non calibrato su dati reali
 kelly_min_trades: 20             # Trade minimi prima di attivare Kelly
 
 # === BYBIT FUTURES FEES (Standard Tier) ===

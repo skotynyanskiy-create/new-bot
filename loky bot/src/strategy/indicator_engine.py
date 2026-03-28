@@ -99,6 +99,8 @@ class IndicatorEngine:
         self._bb_lower_val:  Optional[Decimal] = None
         self._bb_middle_val: Optional[Decimal] = None
         self._bb_width_val:  Optional[Decimal] = None
+        self._bb_sum:        Optional[Decimal] = None  # running sum per O(1) BB
+        self._bb_sumsq:      Optional[Decimal] = None  # running sum of squares
 
         # --- EMA Ribbon (8, 13, 21, 34, 55) ---
         self._ribbon_vals:  dict[int, Optional[Decimal]] = {p: None for p in _RIBBON_PERIODS}

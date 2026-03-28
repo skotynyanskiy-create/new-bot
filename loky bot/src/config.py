@@ -267,6 +267,11 @@ class BotSettings(BaseSettings):
             logger.warning("⚠️  Leverage %dx è molto elevato — rischio liquidazione!", self.leverage)
         if self.live_trading_enabled and not self.testnet:
             logger.warning("🔴 LIVE TRADING ATTIVO — ordini reali verranno inviati!")
+        elif not self.live_trading_enabled:
+            logger.warning(
+                "📄 PAPER TRADING MODE — nessun ordine reale. "
+                "Imposta live_trading_enabled: true in config.yaml per il live."
+            )
 
     @classmethod
     def load(cls) -> "BotSettings":

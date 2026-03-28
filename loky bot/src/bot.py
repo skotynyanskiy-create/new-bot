@@ -472,8 +472,10 @@ class LokyBot:
             async_tasks.append(self._update_sentiment(candle))
         if async_tasks:
             results = await asyncio.gather(*async_tasks, return_exceptions=True)
-            # Il primo risultato potrebbe essere un Signal (funding) o None (sentiment)
             for r in results:
+                if isinstance(r, Exception):
+                    logger.debug("%s Async signal error (ignorato): %s", self.symbol, r)
+                    continue
                 if isinstance(r, Signal) and r.signal_type != SignalType.NONE:
                     signals.append(r)
 
@@ -1540,10 +1542,37 @@ class LokyBot:
                 self._position_side = Side.BUY if inv > _ZERO else Side.SELL
                 self._entry_price = avg_entry
                 self._state = BotState.POSITION_OPEN
+                self._kelly_risk_size = abs(inv)
+                self._kelly_risk_entry = avg_entry
+
+                # Ricostruisci SL e TP di emergenza basati su config default
+                # (gli indicatori potrebbero non essere pronti al load, verranno
+                # aggiornati al primo on_candle con trailing/partial TP)
+                sl_mult = self._cfg.strategy.sl_atr_mult
+                tp1_mult = self._cfg.strategy.partial_tp1_atr
+                # SL di emergenza: usa 2% del prezzo come fallback se ATR non disponibile
+                emergency_sl_dist = avg_entry * Decimal('0.02')
+                if self._position_side == Side.BUY:
+                    self._sl_price = avg_entry - emergency_sl_dist
+                    self._tp_levels = [
+                        TPLevel(avg_entry + emergency_sl_dist * Decimal('1.5'), self._cfg.strategy.partial_tp1_pct),
+                        TPLevel(avg_entry + emergency_sl_dist * Decimal('2.5'), self._cfg.strategy.partial_tp2_pct),
+                        TPLevel(avg_entry + emergency_sl_dist * Decimal('4.0'), self._cfg.strategy.partial_tp3_pct),
+                    ]
+                else:
+                    self._sl_price = avg_entry + emergency_sl_dist
+                    self._tp_levels = [
+                        TPLevel(avg_entry - emergency_sl_dist * Decimal('1.5'), self._cfg.strategy.partial_tp1_pct),
+                        TPLevel(avg_entry - emergency_sl_dist * Decimal('2.5'), self._cfg.strategy.partial_tp2_pct),
+                        TPLevel(avg_entry - emergency_sl_dist * Decimal('4.0'), self._cfg.strategy.partial_tp3_pct),
+                    ]
+                self._sl_price_orig = self._sl_price
+
                 logger.warning(
-                    "%s [Loky] POSIZIONE RIPRISTINATA: %s %.3f @ %.4f — "
-                    "Il bot continuerà a gestire questa posizione.",
-                    self.symbol, self._position_side.name, self._position_size, avg_entry,
+                    "%s [Loky] POSIZIONE RIPRISTINATA: %s %.3f @ %.4f | "
+                    "SL=%.4f TP1=%.4f (emergency defaults, ATR-based al primo candle).",
+                    self.symbol, self._position_side.name, self._position_size,
+                    avg_entry, self._sl_price, self._tp_levels[0].price,
                 )
             else:
                 logger.info("%s [Loky] Stato caricato: PnL=%.4f USDT, trade=%d (FLAT)",
